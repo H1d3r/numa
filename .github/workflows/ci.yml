@@ -20,6 +20,10 @@ on:
       - 'scripts/serve-site.sh'
       - 'scripts/generate-blog-index.sh'
 
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 env:
   CARGO_TERM_COLOR: always
 
@@ -81,6 +85,10 @@ jobs:
     steps:
       - uses: actions/checkout@v6
       - uses: cachix/install-nix-action@v31
+      - uses: nix-community/cache-nix-action@v6
+        with:
+          primary-key: nix-${{ runner.os }}-${{ hashFiles('flake.lock', 'flake.nix', 'Cargo.lock') }}
+          restore-prefixes-first-match: nix-${{ runner.os }}-
       - name: build
         run: nix build .#numa
       - name: smoke test
