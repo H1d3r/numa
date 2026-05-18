@@ -1,0 +1,488 @@
+//! Pkarr Phase 1: relay resolution + petnames.
+//!
+//! Resolve Ed25519 public keys as domain names. Signed DNS records are fetched
+//! from an HTTP relay (default `relay.pkarr.org`), verified with `ring`, then
+//! parsed via Numa's own `DnsPacket::from_buffer()`. No new dependencies.
+//!
+//! Petnames live under `.key` (not `.numa`) — see `docs/implementation/pkarr-integration.md`
+//! for the trust-model rationale.
+
+use std::collections::HashMap;
+use std::sync::{Arc, RwLock};
+use std::time::{Duration, Instant};
+
+use log::{debug, warn};
+
+use crate::buffer::BytePacketBuffer;
+use crate::config::PkarrConfig;
+use crate::header::ResultCode;
+use crate::packet::DnsPacket;
+use crate::question::QueryType;
+use crate::record::DnsRecord;
+
+const Z32_ALPHABET: &[u8] = b"ybndrfg8ejkmcpqxot1uwisza345h769";
+const Z32_KEY_LEN: usize = 52;
+const MAX_SIGNED_PACKET_BYTES: usize = 1072;
+const RELAY_TIMEOUT: Duration = Duration::from_secs(10);
+/// Pkarr signed packets carry no DNS TTL of their own; this is the resolver-side
+/// cache freshness window. 5 min matches typical short-TTL DNS without spamming
+/// the relay.
+const CACHE_TTL: Duration = Duration::from_secs(300);
+
+#[derive(Clone, Debug)]
+struct CachedPacket {
+    dns_bytes: Vec<u8>,
+    fetched_at: Instant,
+}
+
+pub struct PkarrStore {
+    packets: HashMap<[u8; 32], CachedPacket>,
+    petnames: HashMap<String, [u8; 32]>,
+    relay_url: String,
+    client: reqwest::Client,
+}
+
+impl PkarrStore {
+    pub fn new(
+        config: &PkarrConfig,
+        resolver: Option<Arc<crate::bootstrap_resolver::NumaResolver>>,
+    ) -> Self {
+        let mut petnames = HashMap::new();
+        for (name, key_str) in &config.petnames {
+            match decode_key(key_str) {
+                Some(key) => {
+                    petnames.insert(name.clone(), key);
+                }
+                None => warn!("pkarr: invalid key for petname '{}': {}", name, key_str),
+            }
+        }
+        PkarrStore {
+            packets: HashMap::new(),
+            petnames,
+            relay_url: config.relay.trim_end_matches('/').to_string(),
+            client: crate::forward::build_https_client_with_resolver(1, resolver),
+        }
+    }
+
+    pub fn resolve_petname(&self, name: &str) -> Option<[u8; 32]> {
+        self.petnames.get(name).copied()
+    }
+
+    pub fn list_petnames(&self) -> Vec<(String, String)> {
+        let mut entries: Vec<_> = self
+            .petnames
+            .iter()
+            .map(|(n, k)| (n.clone(), z32_encode(k)))
+            .collect();
+        entries.sort_by(|a, b| a.0.cmp(&b.0));
+        entries
+    }
+
+    pub fn add_petname(&mut self, name: String, key: [u8; 32]) {
+        self.petnames.insert(name, key);
+    }
+
+    pub fn remove_petname(&mut self, name: &str) -> bool {
+        self.petnames.remove(name).is_some()
+    }
+}
+
+fn z32_encode(bytes: &[u8]) -> String {
+    let mut out = String::with_capacity(bytes.len().div_ceil(5) * 8);
+    let mut buf: u64 = 0;
+    let mut bits = 0u32;
+    for &b in bytes {
+        buf = (buf << 8) | b as u64;
+        bits += 8;
+        while bits >= 5 {
+            bits -= 5;
+            let idx = ((buf >> bits) & 0x1f) as usize;
+            out.push(Z32_ALPHABET[idx] as char);
+        }
+    }
+    if bits > 0 {
+        let idx = ((buf << (5 - bits)) & 0x1f) as usize;
+        out.push(Z32_ALPHABET[idx] as char);
+    }
+    out
+}
+
+fn z32_decode(s: &str) -> Option<Vec<u8>> {
+    let mut out = Vec::with_capacity(s.len() * 5 / 8);
+    let mut buf: u64 = 0;
+    let mut bits = 0u32;
+    for c in s.chars() {
+        let idx = Z32_ALPHABET.iter().position(|&a| a == c as u8)?;
+        buf = (buf << 5) | idx as u64;
+        bits += 5;
+        if bits >= 8 {
+            bits -= 8;
+            out.push(((buf >> bits) & 0xff) as u8);
+        }
+    }
+    Some(out)
+}
+
+pub fn is_z32_key_label(label: &str) -> bool {
+    decode_key(label).is_some()
+}
+
+/// Returns the 32-byte key iff `s` is a valid z-base32 string decoding to 32 bytes.
+/// Length-agnostic (handles raw key strings from config); use `is_z32_key_label`
+/// at the boundary where label-length matters.
+pub fn decode_key(s: &str) -> Option<[u8; 32]> {
+    let bytes = z32_decode(s)?;
+    (bytes.len() == 32).then(|| {
+        let mut key = [0u8; 32];
+        key.copy_from_slice(&bytes);
+        key
+    })
+}
+
+/// Build the bencoded signable payload: `3:seqi{ts}e1:v{len}:{dns}`.
+/// Fixed template per BEP44 / pkarr — not a general bencode encoder.
+fn build_signable(timestamp: u64, dns_bytes: &[u8]) -> Vec<u8> {
+    let ts = timestamp.to_string();
+    let len = dns_bytes.len().to_string();
+    let mut buf = Vec::with_capacity(8 + ts.len() + 4 + len.len() + 1 + dns_bytes.len());
+    buf.extend_from_slice(b"3:seqi");
+    buf.extend_from_slice(ts.as_bytes());
+    buf.extend_from_slice(b"e1:v");
+    buf.extend_from_slice(len.as_bytes());
+    buf.push(b':');
+    buf.extend_from_slice(dns_bytes);
+    buf
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum PkarrTarget {
+    Key {
+        pubkey: [u8; 32],
+        subdomain: Option<String>,
+    },
+    Petname {
+        name: String,
+        subdomain: Option<String>,
+    },
+}
+
+/// Classify a qname for pkarr routing. Returns:
+///   - `Key` when any label is a 52-char z-base32 pubkey
+///   - `Petname` when qname ends in `.key` and the label before it isn't a z32 key
+///   - `None` otherwise (not a pkarr query)
+///
+/// Examples:
+///   `<z32>`                  → Key, subdomain None
+///   `<z32>.key`              → Key, subdomain None
+///   `git.<z32>.key`          → Key, subdomain "git"
+///   `alice.key`              → Petname "alice", subdomain None
+///   `git.alice.key`          → Petname "alice", subdomain "git"
+///   `example.com`            → None
+pub fn classify(qname: &str) -> Option<PkarrTarget> {
+    let labels: Vec<&str> = qname.split('.').collect();
+    for (i, label) in labels.iter().enumerate().rev() {
+        if label.len() != Z32_KEY_LEN {
+            continue;
+        }
+        if let Some(pubkey) = decode_key(label) {
+            let subdomain = (i > 0).then(|| labels[..i].join("."));
+            return Some(PkarrTarget::Key { pubkey, subdomain });
+        }
+    }
+    // Petname requires the exact `.key` suffix.
+    let stripped = qname.strip_suffix(".key")?;
+    if stripped.is_empty() {
+        return None;
+    }
+    let (name, subdomain) = match stripped.rsplit_once('.') {
+        Some((sub, name)) => (name.to_string(), Some(sub.to_string())),
+        None => (stripped.to_string(), None),
+    };
+    Some(PkarrTarget::Petname { name, subdomain })
+}
+
+/// Resolve a pkarr domain. Returns `Some` on success, `None` on fetch/verify
+/// failure (caller decides SERVFAIL vs NXDOMAIN). Records are rewritten to
+/// `qname` so the client sees the name it queried. Sync fetch on cache miss
+/// or stale; SWR + dedup are Phase 2.
+pub async fn resolve(
+    query: &DnsPacket,
+    qname: &str,
+    qtype: QueryType,
+    pubkey: &[u8; 32],
+    subdomain: Option<&str>,
+    store: &Arc<RwLock<PkarrStore>>,
+) -> Option<DnsPacket> {
+    let (cached, relay_url, client) = {
+        let s = store.read().ok()?;
+        let cached = s
+            .packets
+            .get(pubkey)
+            .filter(|p| p.fetched_at.elapsed() < CACHE_TTL)
+            .cloned();
+        (cached, s.relay_url.clone(), s.client.clone())
+    };
+
+    let packet = match cached {
+        Some(p) => p,
+        None => match fetch_from_relay(&client, &relay_url, pubkey).await {
+            Ok(fresh) => {
+                if let Ok(mut w) = store.write() {
+                    w.packets.insert(*pubkey, fresh.clone());
+                }
+                fresh
+            }
+            Err(e) => {
+                debug!(
+                    "pkarr: relay fetch failed for {}: {}",
+                    z32_encode(pubkey),
+                    e
+                );
+                return None;
+            }
+        },
+    };
+
+    let mut buf = BytePacketBuffer::from_bytes(&packet.dns_bytes);
+    let inner = match DnsPacket::from_buffer(&mut buf) {
+        Ok(p) => p,
+        Err(e) => {
+            warn!("pkarr: malformed inner DNS packet: {}", e);
+            return None;
+        }
+    };
+
+    let answers = filter_matching_records(&inner.answers, pubkey, subdomain, qtype, qname);
+    let mut resp = DnsPacket::response_from(query, ResultCode::NOERROR);
+    resp.answers = answers;
+    Some(resp)
+}
+
+/// Filter pkarr records matching the requested subdomain + qtype, rewriting
+/// the domain to `qname` so clients see their own query name.
+///
+/// Owner-name forms accepted in published packets:
+///   - `<z32key>` or `<z32key>.`        → apex (absolute form, observed live)
+///   - `<sub>.<z32key>`                 → subdomain (absolute)
+///   - `@` or empty                     → apex (publisher convention)
+///   - `<sub>`                          → subdomain (relative to origin)
+fn filter_matching_records(
+    records: &[DnsRecord],
+    pubkey: &[u8; 32],
+    subdomain: Option<&str>,
+    qtype: QueryType,
+    qname: &str,
+) -> Vec<DnsRecord> {
+    let z32 = z32_encode(pubkey);
+    let want_apex = subdomain.is_none();
+    let want_num = qtype.to_num();
+    records
+        .iter()
+        .filter(|r| r.query_type().to_num() == want_num)
+        .filter(|r| {
+            let dom = r.domain().trim_end_matches('.').to_lowercase();
+            if want_apex {
+                dom.is_empty() || dom == "@" || dom == z32
+            } else {
+                let sub = subdomain.unwrap();
+                let abs = format!("{}.{}", sub, z32);
+                dom == sub || dom == abs
+            }
+        })
+        .map(|r| {
+            let mut cloned = r.clone();
+            cloned.set_domain(qname.to_string());
+            cloned
+        })
+        .collect()
+}
+
+/// Wire layout: `<64B sig><8B ts-BE><dns bytes>` (max 1072 bytes).
+async fn fetch_from_relay(
+    client: &reqwest::Client,
+    relay_url: &str,
+    pubkey: &[u8; 32],
+) -> crate::Result<CachedPacket> {
+    let url = format!("{}/{}", relay_url, z32_encode(pubkey));
+    let resp = client.get(&url).timeout(RELAY_TIMEOUT).send().await?;
+    if !resp.status().is_success() {
+        return Err(format!("relay returned HTTP {}", resp.status()).into());
+    }
+    let body = resp.bytes().await?;
+    if body.len() < 72 {
+        return Err(format!("relay response too short: {} bytes", body.len()).into());
+    }
+    if body.len() > MAX_SIGNED_PACKET_BYTES {
+        return Err(format!("relay response too large: {} bytes", body.len()).into());
+    }
+    let mut ts_bytes = [0u8; 8];
+    ts_bytes.copy_from_slice(&body[64..72]);
+    let timestamp = u64::from_be_bytes(ts_bytes);
+    let dns_bytes = body[72..].to_vec();
+
+    let signable = build_signable(timestamp, &dns_bytes);
+    if !crate::dnssec::verify_ed25519(pubkey, &signable, &body[..64]) {
+        return Err("signature verification failed".into());
+    }
+
+    Ok(CachedPacket {
+        dns_bytes,
+        fetched_at: Instant::now(),
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn key_for(b: u8) -> String {
+        z32_encode(&[b; 32])
+    }
+
+    #[test]
+    fn z32_roundtrip_32_bytes() {
+        let bytes: [u8; 32] = [
+            0x1c, 0x3f, 0xab, 0xd0, 0x45, 0x19, 0x27, 0x84, 0xe2, 0x9d, 0x11, 0x88, 0x66, 0xc3,
+            0xf5, 0xee, 0x09, 0x12, 0x34, 0x56, 0x78, 0x9a, 0xbc, 0xde, 0xf0, 0x11, 0x22, 0x33,
+            0x44, 0x55, 0x66, 0x77,
+        ];
+        let encoded = z32_encode(&bytes);
+        assert_eq!(encoded.len(), Z32_KEY_LEN);
+        assert_eq!(z32_decode(&encoded).unwrap(), bytes);
+    }
+
+    #[test]
+    fn z32_decode_rejects_invalid_chars() {
+        assert!(z32_decode("this has spaces").is_none());
+        assert!(z32_decode("AAAA").is_none()); // uppercase not in alphabet
+    }
+
+    #[test]
+    fn signable_matches_bencode_template() {
+        assert_eq!(
+            build_signable(1234567, b"hello"),
+            b"3:seqi1234567e1:v5:hello"
+        );
+    }
+
+    #[test]
+    fn verify_rejects_bad_signature() {
+        // Random sig over a non-zero key must not verify (avoids Ed25519
+        // neutral-element edge cases that could spuriously succeed).
+        let signable = build_signable(0, b"anything");
+        assert!(!crate::dnssec::verify_ed25519(
+            &[1u8; 32],
+            &signable,
+            &[0x42u8; 64]
+        ));
+    }
+
+    #[test]
+    fn classify_raw_key_no_tld() {
+        let key = key_for(0);
+        let target = classify(&key).unwrap();
+        assert_eq!(
+            target,
+            PkarrTarget::Key {
+                pubkey: [0u8; 32],
+                subdomain: None,
+            }
+        );
+    }
+
+    #[test]
+    fn classify_raw_key_with_subdomain() {
+        let key = key_for(0);
+        let target = classify(&format!("git.{}", key)).unwrap();
+        assert_eq!(
+            target,
+            PkarrTarget::Key {
+                pubkey: [0u8; 32],
+                subdomain: Some("git".to_string()),
+            }
+        );
+    }
+
+    #[test]
+    fn classify_raw_key_with_key_tld() {
+        let key = key_for(0);
+        let target = classify(&format!("{}.key", key)).unwrap();
+        assert_eq!(
+            target,
+            PkarrTarget::Key {
+                pubkey: [0u8; 32],
+                subdomain: None,
+            }
+        );
+    }
+
+    #[test]
+    fn classify_raw_key_with_subdomain_and_key_tld() {
+        let key = key_for(0);
+        let target = classify(&format!("git.{}.key", key)).unwrap();
+        assert_eq!(
+            target,
+            PkarrTarget::Key {
+                pubkey: [0u8; 32],
+                subdomain: Some("git".to_string()),
+            }
+        );
+    }
+
+    #[test]
+    fn classify_petname_single_label() {
+        assert_eq!(
+            classify("alice.key").unwrap(),
+            PkarrTarget::Petname {
+                name: "alice".to_string(),
+                subdomain: None,
+            }
+        );
+    }
+
+    #[test]
+    fn classify_petname_with_subdomain() {
+        assert_eq!(
+            classify("git.alice.key").unwrap(),
+            PkarrTarget::Petname {
+                name: "alice".to_string(),
+                subdomain: Some("git".to_string()),
+            }
+        );
+    }
+
+    #[test]
+    fn classify_petname_deep_subdomain() {
+        assert_eq!(
+            classify("deep.nested.alice.key").unwrap(),
+            PkarrTarget::Petname {
+                name: "alice".to_string(),
+                subdomain: Some("deep.nested".to_string()),
+            }
+        );
+    }
+
+    #[test]
+    fn classify_non_pkarr_returns_none() {
+        assert!(classify("example.com").is_none());
+        assert!(classify("").is_none());
+        assert!(classify("alice.numa").is_none());
+    }
+
+    #[test]
+    fn classify_bare_key_tld_is_none() {
+        // Just "key" or ".key" on its own isn't a routable petname.
+        assert!(classify("key").is_none());
+    }
+
+    #[test]
+    fn is_z32_key_label_strictness() {
+        assert!(is_z32_key_label(&key_for(0)));
+        assert!(!is_z32_key_label("alice"));
+        assert!(!is_z32_key_label(""));
+        // Right length but invalid char:
+        let mut bad = key_for(0);
+        bad.replace_range(0..1, "A");
+        assert!(!is_z32_key_label(&bad));
+    }
+}

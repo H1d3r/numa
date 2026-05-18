@@ -56,6 +56,9 @@ pub fn router(ctx: Arc<ServerCtx>) -> Router {
         .route("/services/{name}/routes", get(list_routes))
         .route("/services/{name}/routes", post(add_route))
         .route("/services/{name}/routes", delete(remove_route))
+        .route("/petnames", get(list_petnames))
+        .route("/petnames", post(create_petname))
+        .route("/petnames/{name}", delete(remove_petname))
         .route("/ca.pem", get(serve_ca))
         .route("/qr", get(serve_qr))
         .route("/fonts/fonts.css", get(serve_fonts_css))
@@ -234,6 +237,7 @@ struct QueriesStats {
     cached: u64,
     local: u64,
     overridden: u64,
+    pkarr: u64,
     blocked: u64,
     errors: u64,
 }
@@ -580,6 +584,7 @@ async fn stats(State(ctx): State<Arc<ServerCtx>>) -> Json<StatsResponse> {
             cached: snap.cached,
             local: snap.local,
             overridden: snap.overridden,
+            pkarr: snap.pkarr,
             blocked: snap.blocked,
             errors: snap.errors,
         },
@@ -1008,6 +1013,85 @@ async fn remove_route(
         StatusCode::NO_CONTENT
     } else {
         StatusCode::NOT_FOUND
+    }
+}
+
+// ─── Pkarr petnames ─────────────────────────────────────────────────────────
+
+#[derive(Serialize)]
+struct PetnameEntry {
+    name: String,
+    key: String,
+}
+
+#[derive(Deserialize)]
+struct CreatePetnameRequest {
+    name: String,
+    key: String,
+}
+
+#[derive(Serialize)]
+struct PetnameError {
+    error: &'static str,
+}
+
+fn petname_err(code: StatusCode, msg: &'static str) -> (StatusCode, Json<PetnameError>) {
+    (code, Json(PetnameError { error: msg }))
+}
+
+fn petname_disabled() -> (StatusCode, Json<PetnameError>) {
+    petname_err(StatusCode::NOT_FOUND, "pkarr not enabled")
+}
+
+fn bad_petname(msg: &'static str) -> (StatusCode, Json<PetnameError>) {
+    petname_err(StatusCode::BAD_REQUEST, msg)
+}
+
+async fn list_petnames(
+    State(ctx): State<Arc<ServerCtx>>,
+) -> Result<Json<Vec<PetnameEntry>>, (StatusCode, Json<PetnameError>)> {
+    let store = ctx.pkarr.as_ref().ok_or_else(petname_disabled)?;
+    let entries = store
+        .read()
+        .unwrap()
+        .list_petnames()
+        .into_iter()
+        .map(|(name, key)| PetnameEntry { name, key })
+        .collect();
+    Ok(Json(entries))
+}
+
+async fn create_petname(
+    State(ctx): State<Arc<ServerCtx>>,
+    Json(req): Json<CreatePetnameRequest>,
+) -> Result<StatusCode, (StatusCode, Json<PetnameError>)> {
+    let store = ctx.pkarr.as_ref().ok_or_else(petname_disabled)?;
+    let name = req.name.trim().to_lowercase();
+    if name.is_empty() || name.contains('.') || name.contains(' ') {
+        return Err(bad_petname(
+            "name must be a single label (no dots or spaces)",
+        ));
+    }
+    // A z32-key-shaped petname would be unreachable: classify() matches the
+    // raw key first and never hits the petname map.
+    if crate::pkarr::is_z32_key_label(&name) {
+        return Err(bad_petname("name must not be a 52-char z-base32 key"));
+    }
+    let key = crate::pkarr::decode_key(&req.key)
+        .ok_or_else(|| bad_petname("key must be a 52-char z-base32 public key"))?;
+    store.write().unwrap().add_petname(name, key);
+    Ok(StatusCode::CREATED)
+}
+
+async fn remove_petname(
+    State(ctx): State<Arc<ServerCtx>>,
+    Path(name): Path<String>,
+) -> Result<StatusCode, (StatusCode, Json<PetnameError>)> {
+    let store = ctx.pkarr.as_ref().ok_or_else(petname_disabled)?;
+    if store.write().unwrap().remove_petname(&name) {
+        Ok(StatusCode::NO_CONTENT)
+    } else {
+        Err(petname_err(StatusCode::NOT_FOUND, "petname not found"))
     }
 }
 

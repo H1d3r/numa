@@ -37,6 +37,32 @@ pub struct Config {
     pub forwarding: Vec<ForwardingRuleConfig>,
     #[serde(default)]
     pub client_policy: Vec<crate::client_policy::ClientPolicyConfig>,
+    #[serde(default)]
+    pub pkarr: PkarrConfig,
+}
+
+#[derive(Deserialize, Clone, Debug)]
+pub struct PkarrConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default = "default_pkarr_relay")]
+    pub relay: String,
+    #[serde(default)]
+    pub petnames: HashMap<String, String>,
+}
+
+impl Default for PkarrConfig {
+    fn default() -> Self {
+        PkarrConfig {
+            enabled: false,
+            relay: default_pkarr_relay(),
+            petnames: HashMap::new(),
+        }
+    }
+}
+
+fn default_pkarr_relay() -> String {
+    "https://relay.pkarr.org".to_string()
 }
 
 #[derive(Deserialize, Clone, Debug)]
@@ -1329,6 +1355,35 @@ relay = "https://odoh-relay.numa.rs/relay"
         let config: Config = toml::from_str(toml).unwrap();
         let err = config.upstream.odoh_upstream().unwrap_err().to_string();
         assert!(err.contains("upstream.target"), "got: {err}");
+    }
+
+    // ── pkarr config ────────────────────────────────────────────────────
+
+    #[test]
+    fn pkarr_disabled_by_default() {
+        let config: Config = toml::from_str("").unwrap();
+        assert!(!config.pkarr.enabled);
+        assert_eq!(config.pkarr.relay, "https://relay.pkarr.org");
+        assert!(config.pkarr.petnames.is_empty());
+    }
+
+    #[test]
+    fn pkarr_parses_petnames() {
+        let toml = r#"
+            [pkarr]
+            enabled = true
+            relay = "https://example.relay"
+
+            [pkarr.petnames]
+            alice = "yqrx81zchh6aotjj85s96gdqbmsoprxr3ks6bnptghq16aadk9ko"
+        "#;
+        let config: Config = toml::from_str(toml).unwrap();
+        assert!(config.pkarr.enabled);
+        assert_eq!(config.pkarr.relay, "https://example.relay");
+        assert_eq!(
+            config.pkarr.petnames.get("alice").map(String::as_str),
+            Some("yqrx81zchh6aotjj85s96gdqbmsoprxr3ks6bnptghq16aadk9ko")
+        );
     }
 
     // ── issue #82: [[forwarding]] config section ────────────────────────

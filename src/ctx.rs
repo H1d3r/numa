@@ -85,6 +85,10 @@ pub struct ServerCtx {
     pub filter_aaaa: bool,
     pub allow_from: crate::acl::AllowFromAcl,
     pub client_policy: crate::client_policy::ClientPolicySet,
+    /// Pkarr store — `None` when `[pkarr] enabled = false` (the default).
+    /// `Arc<RwLock<...>>` so background refresh tasks can clone it across
+    /// `.await` points without borrowing `ServerCtx`.
+    pub pkarr: Option<Arc<RwLock<crate::pkarr::PkarrStore>>>,
 }
 
 /// Transport-agnostic DNS resolution. Runs the full pipeline (overrides, blocklist,
@@ -244,10 +248,11 @@ async fn resolve_with_cname_chase(
     let mut visited = HashSet::new();
     visited.insert(qname.to_ascii_lowercase());
 
-    let (mut resp, path, dnssec, mut ut) = match resolve_local(query, src_addr, qname, qtype, ctx) {
-        Some((r, p, d)) => (r, p, d, None),
-        None => resolve_remote(query, raw_wire, src_addr, qname, qtype, ctx).await,
-    };
+    let (mut resp, path, dnssec, mut ut) =
+        match resolve_local(query, src_addr, qname, qtype, ctx).await {
+            Some((r, p, d)) => (r, p, d, None),
+            None => resolve_remote(query, raw_wire, src_addr, qname, qtype, ctx).await,
+        };
     let mut current_qname = qname.to_string();
 
     loop {
@@ -276,7 +281,7 @@ async fn resolve_with_cname_chase(
             .write(&mut sub_buf)
             .expect("sub-query serialization");
         let (sub_resp, _, _, sub_ut) =
-            match resolve_local(&sub_query, src_addr, &target, qtype, ctx) {
+            match resolve_local(&sub_query, src_addr, &target, qtype, ctx).await {
                 Some((r, p, d)) => (r, p, d, None),
                 None => {
                     resolve_remote(&sub_query, sub_buf.filled(), src_addr, &target, qtype, ctx)
@@ -291,10 +296,10 @@ async fn resolve_with_cname_chase(
     }
 }
 
-/// Local resolution pipeline: overrides, .localhost, zones, special-use, .numa
-/// proxy TLD, blocklist, AAAA filter. Returns `None` to fall through to remote
-/// resolution (cache/forwarding/recursive/upstream).
-fn resolve_local(
+/// Local resolution pipeline: overrides, .localhost, zones, pkarr, special-use,
+/// .numa proxy TLD, blocklist, AAAA filter. Returns `None` to fall through to
+/// remote resolution (cache/forwarding/recursive/upstream).
+async fn resolve_local(
     query: &DnsPacket,
     src_addr: SocketAddr,
     qname: &str,
@@ -323,6 +328,9 @@ fn resolve_local(
         let mut resp = DnsPacket::response_from(query, ResultCode::NOERROR);
         resp.answers = records;
         return Some((resp, QueryPath::Local, DnssecStatus::Indeterminate));
+    }
+    if let Some(result) = resolve_pkarr(query, qname, qtype, ctx).await {
+        return Some(result);
     }
     if is_special_use_domain(qname)
         && crate::system_dns::match_forwarding_rule(qname, &ctx.forwarding_rules).is_none()
@@ -373,6 +381,36 @@ fn resolve_local(
         return Some((resp, QueryPath::Local, DnssecStatus::Indeterminate));
     }
     None
+}
+
+/// Resolve a pkarr query. Returns:
+///   - `Some(NOERROR + records)` on relay resolution + signature verification success
+///   - `Some(SERVFAIL)` when the name is pkarr-shaped but relay/verify fails
+///   - `Some(NXDOMAIN)` when a `.key` petname is unknown — must NOT leak upstream
+///   - `None` when the query isn't pkarr-shaped (fall through to the rest of local)
+async fn resolve_pkarr(
+    query: &DnsPacket,
+    qname: &str,
+    qtype: QueryType,
+    ctx: &ServerCtx,
+) -> Option<(DnsPacket, QueryPath, DnssecStatus)> {
+    let store = ctx.pkarr.as_ref()?;
+    let pkarr = |resp| Some((resp, QueryPath::Pkarr, DnssecStatus::Indeterminate));
+
+    let (pubkey, subdomain) = match crate::pkarr::classify(qname)? {
+        crate::pkarr::PkarrTarget::Key { pubkey, subdomain } => (pubkey, subdomain),
+        crate::pkarr::PkarrTarget::Petname { name, subdomain } => {
+            let Some(pk) = store.read().unwrap().resolve_petname(&name) else {
+                return pkarr(DnsPacket::response_from(query, ResultCode::NXDOMAIN));
+            };
+            (pk, subdomain)
+        }
+    };
+
+    let resp = crate::pkarr::resolve(query, qname, qtype, &pubkey, subdomain.as_deref(), store)
+        .await
+        .unwrap_or_else(|| DnsPacket::response_from(query, ResultCode::SERVFAIL));
+    pkarr(resp)
 }
 
 /// Resolve `.numa` queries:
@@ -1373,6 +1411,26 @@ mod tests {
         assert_eq!(path, QueryPath::Overridden);
         assert_eq!(resp.header.rescode, ResultCode::NOERROR);
         assert_eq!(resp.answers.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn pipeline_unknown_petname_returns_nxdomain() {
+        let cfg = crate::config::PkarrConfig {
+            enabled: true,
+            relay: "https://relay.invalid".to_string(),
+            petnames: std::collections::HashMap::new(),
+        };
+        let mut ctx = crate::testutil::test_ctx().await;
+        ctx.pkarr = Some(Arc::new(std::sync::RwLock::new(
+            crate::pkarr::PkarrStore::new(&cfg, None),
+        )));
+        let ctx = Arc::new(ctx);
+
+        // Unknown petname resolves before any relay fetch — NXDOMAIN, never leaks
+        // upstream, tagged PKARR. Exercises the local-pipeline integration seam.
+        let (resp, path) = resolve_in_test(&ctx, "ghost.key", QueryType::A).await;
+        assert_eq!(path, QueryPath::Pkarr);
+        assert_eq!(resp.header.rescode, ResultCode::NXDOMAIN);
     }
 
     #[tokio::test]

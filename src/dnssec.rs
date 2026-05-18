@@ -648,7 +648,7 @@ fn verify_ecdsa_p256(public_key: &[u8], signed_data: &[u8], sig: &[u8]) -> bool 
     key.verify(signed_data, sig).is_ok()
 }
 
-fn verify_ed25519(public_key: &[u8], signed_data: &[u8], sig: &[u8]) -> bool {
+pub(crate) fn verify_ed25519(public_key: &[u8], signed_data: &[u8], sig: &[u8]) -> bool {
     if public_key.len() != 32 || sig.len() != 64 {
         return false;
     }

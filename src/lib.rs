@@ -19,6 +19,7 @@ pub mod mobileconfig;
 pub mod odoh;
 pub mod override_store;
 pub mod packet;
+pub mod pkarr;
 pub mod pp2;
 pub mod pp2_udp;
 pub mod proxy;

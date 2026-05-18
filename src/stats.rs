@@ -119,6 +119,7 @@ pub struct ServerStats {
     queries_blocked: u64,
     queries_local: u64,
     queries_overridden: u64,
+    queries_pkarr: u64,
     upstream_errors: u64,
     transport_udp: u64,
     transport_tcp: u64,
@@ -195,6 +196,8 @@ pub enum QueryPath {
     Coalesced,
     Blocked,
     Overridden,
+    /// Resolved via pkarr (signed Ed25519-keyed DNS records).
+    Pkarr,
     UpstreamError,
 }
 
@@ -209,6 +212,7 @@ impl QueryPath {
             QueryPath::Coalesced => "COALESCED",
             QueryPath::Blocked => "BLOCKED",
             QueryPath::Overridden => "OVERRIDE",
+            QueryPath::Pkarr => "PKARR",
             QueryPath::UpstreamError => "SERVFAIL",
         }
     }
@@ -230,6 +234,8 @@ impl QueryPath {
             Some(QueryPath::Blocked)
         } else if s.eq_ignore_ascii_case("OVERRIDE") {
             Some(QueryPath::Overridden)
+        } else if s.eq_ignore_ascii_case("PKARR") {
+            Some(QueryPath::Pkarr)
         } else if s.eq_ignore_ascii_case("SERVFAIL") {
             Some(QueryPath::UpstreamError)
         } else {
@@ -256,6 +262,7 @@ impl ServerStats {
             queries_blocked: 0,
             queries_local: 0,
             queries_overridden: 0,
+            queries_pkarr: 0,
             upstream_errors: 0,
             transport_udp: 0,
             transport_tcp: 0,
@@ -291,6 +298,7 @@ impl ServerStats {
             QueryPath::Coalesced => self.queries_coalesced += 1,
             QueryPath::Blocked => self.queries_blocked += 1,
             QueryPath::Overridden => self.queries_overridden += 1,
+            QueryPath::Pkarr => self.queries_pkarr += 1,
             QueryPath::UpstreamError => self.upstream_errors += 1,
         }
         match transport {
@@ -330,6 +338,7 @@ impl ServerStats {
             cached: self.queries_cached,
             local: self.queries_local,
             overridden: self.queries_overridden,
+            pkarr: self.queries_pkarr,
             blocked: self.queries_blocked,
             errors: self.upstream_errors,
             transport_udp: self.transport_udp,
@@ -356,7 +365,7 @@ impl ServerStats {
         let secs = uptime.as_secs() % 60;
 
         log::info!(
-            "STATS | uptime {}h{}m{}s | total {} | fwd {} | upstream {} | recursive {} | coalesced {} | cached {} | local {} | override {} | blocked {} | errors {} | up-udp {} | up-tcp {} | up-doh {} | up-dot {} | up-odoh {}",
+            "STATS | uptime {}h{}m{}s | total {} | fwd {} | upstream {} | recursive {} | coalesced {} | cached {} | local {} | override {} | pkarr {} | blocked {} | errors {} | up-udp {} | up-tcp {} | up-doh {} | up-dot {} | up-odoh {}",
             hours, mins, secs,
             self.queries_total,
             self.queries_forwarded,
@@ -366,6 +375,7 @@ impl ServerStats {
             self.queries_cached,
             self.queries_local,
             self.queries_overridden,
+            self.queries_pkarr,
             self.queries_blocked,
             self.upstream_errors,
             self.upstream_transport_udp,
@@ -387,6 +397,7 @@ pub struct StatsSnapshot {
     pub cached: u64,
     pub local: u64,
     pub overridden: u64,
+    pub pkarr: u64,
     pub blocked: u64,
     pub errors: u64,
     pub transport_udp: u64,

@@ -140,6 +140,20 @@ pub async fn run(config_path: String) -> crate::Result<()> {
         );
     }
 
+    let pkarr = if config.pkarr.enabled {
+        log::info!(
+            "pkarr enabled — relay: {}, {} petname(s)",
+            config.pkarr.relay,
+            config.pkarr.petnames.len()
+        );
+        Some(Arc::new(RwLock::new(crate::pkarr::PkarrStore::new(
+            &config.pkarr,
+            Some(bootstrap_resolver.clone()),
+        ))))
+    } else {
+        None
+    };
+
     let sockets = bind_udp_listeners(&config.server.bind_addr).await?;
 
     let ctx = Arc::new(ServerCtx {
@@ -189,6 +203,7 @@ pub async fn run(config_path: String) -> crate::Result<()> {
         filter_aaaa: config.server.filter_aaaa,
         allow_from,
         client_policy,
+        pkarr,
     });
 
     let zone_count: usize = ctx.zone_map.len();

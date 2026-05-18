@@ -193,6 +193,17 @@ tld = "numa"
 # enabled = false             # opt-in: verify chain of trust from root KSK
 # strict = false              # true = SERVFAIL on bogus signatures
 
+# Pkarr — self-sovereign names under the `.key` TLD, no ICANN, no registrar.
+# Resolve a 52-char z-base32 Ed25519 pubkey (any label) or a petname mapping it,
+# by fetching the owner's signed records from a relay and verifying the signature
+# locally. Unknown petname → NXDOMAIN (never leaks upstream); relay/verify failure
+# → SERVFAIL. Manage petnames live via the dashboard or /petnames REST endpoints.
+# [pkarr]
+# enabled = false                       # opt-in
+# relay = "https://relay.pkarr.org"     # signed-record relay (default)
+# [pkarr.petnames]
+# blog = "7fmjpcuuzf54hw18bsgi3zihzyh4awseeuq5tmojefaezjbd64cy"  # blog.key → that pubkey
+
 # DNS-over-TLS listener (RFC 7858) — encrypted DNS on port 853
 # [dot]
 # enabled = true              # on by default; set false to disable
