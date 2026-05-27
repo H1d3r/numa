@@ -24,6 +24,7 @@
   --amber: #c0623a;
   --amber-dim: #9e4e2d;
   --teal: #6b7c4e;
+  --teal-dim: #566540;
   --violet: #64748b;
   --violet-dim: #4a5568;
   --emerald: #527a52;
@@ -50,6 +51,7 @@
     --amber: oklch(0.7 0.17 42);
     --amber-dim: oklch(0.6 0.17 42);
     --teal: oklch(0.7 0.09 125);
+    --teal-dim: oklch(0.6 0.09 125);
     --violet: oklch(0.7 0.09 260);
     --violet-dim: oklch(0.6 0.09 260);
     --emerald: oklch(0.6 0.08 144);
@@ -69,6 +71,7 @@
   --amber: oklch(0.7 0.17 42);
   --amber-dim: oklch(0.6 0.17 42);
   --teal: oklch(0.7 0.09 125);
+  --teal-dim: oklch(0.6 0.09 125);
   --violet: oklch(0.7 0.09 260);
   --violet-dim: oklch(0.6 0.09 260);
   --emerald: oklch(0.6 0.08 144);
@@ -334,19 +337,19 @@ body {
   font-size: 0.65rem;
   font-weight: 500;
 }
-.path-tag.FORWARD,
-.path-tag.UPSTREAM  { background: color-mix(in oklch, var(--amber)   12%, transparent); color: var(--amber); }
-.path-tag.RECURSIVE { background: color-mix(in oklch, var(--cyan)    12%, transparent); color: var(--cyan); }
-.path-tag.CACHED,
-.path-tag.DOH       { background: color-mix(in oklch, var(--teal)    12%, transparent); color: var(--teal); }
-.path-tag.LOCAL,
-.path-tag.COALESCED,
-.path-tag.TCP       { background: color-mix(in oklch, var(--violet)  12%, transparent); color: var(--violet); }
-.path-tag.OVERRIDE,
-.path-tag.DOT       { background: color-mix(in oklch, var(--emerald) 12%, transparent); color: var(--emerald); }
-.path-tag.SERVFAIL  { background: color-mix(in oklch, var(--rose)    12%, transparent); color: var(--rose); }
-.path-tag.BLOCKED,
-.path-tag.UDP       { background: color-mix(in oklch, var(--text-dim) 15%, transparent); color: var(--text-dim); }
+.path-tag.FORWARD   { background: rgba(192, 98, 58, 0.12);  color: var(--amber-dim); }
+.path-tag.UPSTREAM  { background: rgba(160, 120, 72, 0.12); color: var(--amber-dim); }
+.path-tag.RECURSIVE { background: rgba(74, 124, 138, 0.12); color: var(--cyan); }
+.path-tag.CACHED    { background: rgba(107, 124, 78, 0.12); color: var(--teal-dim); }
+.path-tag.LOCAL     { background: rgba(100, 116, 139, 0.12); color: var(--violet-dim); }
+.path-tag.OVERRIDE  { background: rgba(82, 122, 82, 0.12);  color: var(--emerald); }
+.path-tag.SERVFAIL  { background: rgba(181, 68, 58, 0.12);  color: var(--rose); }
+.path-tag.BLOCKED   { background: rgba(163, 152, 136, 0.15); color: var(--text-dim); }
+.path-tag.COALESCED { background: rgba(138, 104, 158, 0.12); color: var(--violet-dim); }
+.path-tag.UDP       { background: rgba(163, 152, 136, 0.15); color: var(--text-dim); }
+.path-tag.TCP       { background: rgba(100, 116, 139, 0.12); color: var(--violet-dim); }
+.path-tag.DOT       { background: rgba(82, 122, 82, 0.12);  color: var(--emerald); }
+.path-tag.DOH       { background: rgba(107, 124, 78, 0.12); color: var(--teal); }
 
 /* Sidebar panels */
 .sidebar {
@@ -451,8 +454,8 @@ body {
   border-radius: 3px;
   margin-left: 0.3rem;
 }
-.lan-badge.shared     { background: color-mix(in oklch, var(--emerald) 12%, transparent); color: var(--emerald); }
-.lan-badge.local-only { background: color-mix(in oklch, var(--amber)   12%, transparent); color: var(--amber); }
+.lan-badge.shared     { background: rgba(82, 122, 82, 0.12);  color: var(--emerald); }
+.lan-badge.local-only { background: rgba(192, 98, 58, 0.12); color: var(--amber-dim); }
 
 /* Override form */
 .override-form {
