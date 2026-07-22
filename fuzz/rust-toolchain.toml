@@ -1,0 +1,4 @@
+# cargo-fuzz needs nightly; pin the date so local and CI runs agree.
+# nightly-2025-12-01 is the last build known-good for these targets.
+[toolchain]
+channel = "nightly-2025-12-01"
