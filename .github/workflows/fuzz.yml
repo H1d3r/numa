@@ -57,7 +57,8 @@ jobs:
       # musl binary — and the toolchain only carries gnu std, so every build died
       # with E0463. Pin the target to the toolchain's host instead.
       - name: Resolve host triple
-        run: echo "FUZZ_TRIPLE=$(rustc -vV | sed -n 's/^host: //p')" >> "$GITHUB_ENV"
+        run: |
+          echo "FUZZ_TRIPLE=$(rustc -vV | sed -n 's/^host: //p')" >> "$GITHUB_ENV"
       # Split restore/save rather than actions/cache: its post-step only fires
       # on success, and the run that crashes is the one whose corpus matters.
       - name: Restore corpus
