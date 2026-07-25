@@ -3,6 +3,9 @@
 FUZZ_TOOLCHAIN := nightly-2025-12-01
 FUZZ_TARGET ?= packet_parse
 FUZZ_SECONDS ?= 60
+# cargo-fuzz defaults to its own build triple, which is musl when it arrives via
+# cargo-binstall. Pin it to the toolchain's host.
+FUZZ_TRIPLE := $(shell rustc +$(FUZZ_TOOLCHAIN) -vV | sed -n 's/^host: //p')
 
 all: lint build test
 
@@ -34,7 +37,7 @@ bench:
 # sanitizers are off locally — CI runs the real thing on Linux.
 fuzz:
 	mkdir -p fuzz/corpus/$(FUZZ_TARGET)
-	cargo +$(FUZZ_TOOLCHAIN) fuzz run \
+	cargo +$(FUZZ_TOOLCHAIN) fuzz run --target $(FUZZ_TRIPLE) \
 		$(if $(filter Darwin,$(shell uname -s)),-s none,) \
 		$(FUZZ_TARGET) fuzz/corpus/$(FUZZ_TARGET) fuzz/seeds/$(FUZZ_TARGET) \
 		-- -max_total_time=$(FUZZ_SECONDS) -max_len=4096 -timeout=25

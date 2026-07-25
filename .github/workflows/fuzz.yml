@@ -52,6 +52,12 @@ jobs:
       - uses: taiki-e/install-action@v2
         with:
           tool: cargo-fuzz
+      # cargo-fuzz targets its *own* build triple by default. install-action has
+      # no cargo-fuzz recipe, so it falls back to cargo-binstall, which serves a
+      # musl binary — and the toolchain only carries gnu std, so every build died
+      # with E0463. Pin the target to the toolchain's host instead.
+      - name: Resolve host triple
+        run: echo "FUZZ_TRIPLE=$(rustc -vV | sed -n 's/^host: //p')" >> "$GITHUB_ENV"
       # Split restore/save rather than actions/cache: its post-step only fires
       # on success, and the run that crashes is the one whose corpus matters.
       - name: Restore corpus
@@ -65,14 +71,14 @@ jobs:
         # starts from valid DNS messages; findings accumulate in fuzz/corpus.
         run: |
           mkdir -p fuzz/corpus/${{ matrix.target }}
-          cargo fuzz run ${{ matrix.target }} \
+          cargo fuzz run --target "$FUZZ_TRIPLE" ${{ matrix.target }} \
             fuzz/corpus/${{ matrix.target }} fuzz/seeds/${{ matrix.target }} \
             -- -max_total_time=${FUZZ_SECONDS} -max_len=4096 -timeout=25
       - name: Minimize corpus
         # Only on the cron: cmin costs a full re-run of the corpus, and without
         # it the cached corpus grows until it evicts every other cache entry.
         if: github.event_name == 'schedule'
-        run: cargo fuzz cmin ${{ matrix.target }} -- -timeout=25
+        run: cargo fuzz cmin --target "$FUZZ_TRIPLE" ${{ matrix.target }} -- -timeout=25
       - name: Save corpus
         if: always()
         uses: actions/cache/save@v4
