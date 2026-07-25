@@ -18,6 +18,9 @@ ideal.
 Expect an acknowledgement within a few days. Fixes ship on a coordinated
 timeline: the advisory (and any CVE) is published once a fixed release is out.
 
+Research done in good faith under this policy is welcome: test against your own
+resolver, don't touch other people's, and we won't pursue you for it.
+
 ## Scope
 
 In scope — anything that lets a network peer subvert the resolver:
@@ -45,7 +48,8 @@ Out of scope:
 Defense in depth is automated, not a substitute for review:
 
 - `cargo audit` gates every build; Dependabot proposes dependency bumps monthly.
-- Continuous `cargo fuzz` over the wire parser (`fuzz/`, run in CI) — it has
+- `cargo fuzz` over the wire parser (`fuzz/`): a smoke run on every PR that
+  touches it, a deeper weekly pass, seeded from a committed corpus. It has
   already caught real parser bugs.
 - `clippy -D warnings` is a hard gate.
 
