@@ -27,7 +27,6 @@ use crate::stats::{ServerStats, Transport};
 use crate::system_dns::discover_system_dns;
 use crate::udp_listener::UdpListener;
 
-const QUAD9_IP: &str = "9.9.9.9";
 const DOH_FALLBACK: &str = "https://9.9.9.9/dns-query";
 
 /// Boot the DNS server and run until the UDP listener errors out.
@@ -717,6 +716,13 @@ async fn resolve_upstream_pool(
 async fn network_watch_loop(ctx: Arc<ServerCtx>) {
     let mut tick: u64 = 0;
 
+    // Built once. The URL is an IP literal, so it needs no resolver and can't
+    // loop back through numa.
+    let doh_fallback = Upstream::Doh {
+        url: DOH_FALLBACK.to_string(),
+        client: build_https_client_with_resolver(1, None),
+    };
+
     let mut interval = tokio::time::interval(Duration::from_secs(5));
     interval.tick().await; // skip immediate tick
 
@@ -739,12 +745,19 @@ async fn network_watch_loop(ctx: Arc<ServerCtx>) {
         // Re-detect upstream every 30s or on LAN IP change (auto-detect only)
         if ctx.upstream_auto && (changed || tick.is_multiple_of(6)) {
             let dns_info = crate::system_dns::discover_system_dns();
-            let new_addr = dns_info
+            let detected = dns_info
                 .default_upstream
-                .or_else(crate::system_dns::detect_dhcp_dns)
-                .unwrap_or_else(|| QUAD9_IP.to_string());
+                .or_else(crate::system_dns::detect_dhcp_dns);
             let mut pool = ctx.upstream_pool.lock().unwrap();
-            if pool.maybe_update_primary(&new_addr, ctx.upstream_port) {
+            // Undetectable system DNS resolves to Quad9 DoH here exactly as it
+            // does at startup. Synthesising a bare UDP Quad9 instead silently
+            // downgraded the transport 30s in, stranding every client where
+            // outbound UDP:53 is blocked (#169).
+            let updated = match detected {
+                Some(addr) => pool.maybe_update_primary(&addr, ctx.upstream_port),
+                None => pool.maybe_replace_primary(doh_fallback.clone()),
+            };
+            if updated {
                 info!("upstream changed → {}", pool.label());
                 changed = true;
             }
