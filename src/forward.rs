@@ -278,18 +278,41 @@ impl UpstreamPool {
         self.primary = primary;
     }
 
+    /// Replace the primary with `new` if it differs from the current preferred.
+    /// Returns `true` if the pool changed.
+    ///
+    /// Keeps the TCP sibling in step with the primary. The sibling exists so
+    /// Forward mode survives carriers that drop outbound UDP:53, but failover
+    /// chains `fallback` *after* the primaries, so a sibling left over from the
+    /// previous network is retried before anything reachable (#169).
+    pub fn maybe_replace_primary(&mut self, new: Upstream) -> bool {
+        if self.preferred() == Some(&new) {
+            return false;
+        }
+        let stale_sibling = match self.primary.first() {
+            Some(Upstream::Udp(addr)) => Some(Upstream::Tcp(*addr)),
+            _ => None,
+        };
+        if let Some(stale) = stale_sibling {
+            self.fallback.retain(|u| *u != stale);
+        }
+        if let Upstream::Udp(addr) = new {
+            let sibling = Upstream::Tcp(addr);
+            if !self.fallback.contains(&sibling) {
+                self.fallback.push(sibling);
+            }
+        }
+        self.primary = vec![new];
+        true
+    }
+
     /// Update the primary upstream if `new_addr` (parsed with `port`) differs
     /// from the current preferred upstream. Returns `true` if the pool changed.
     pub fn maybe_update_primary(&mut self, new_addr: &str, port: u16) -> bool {
         let Ok(new_sock) = format!("{}:{}", new_addr, port).parse::<SocketAddr>() else {
             return false;
         };
-        let new_upstream = Upstream::Udp(new_sock);
-        if self.preferred() == Some(&new_upstream) {
-            return false;
-        }
-        self.primary = vec![new_upstream];
-        true
+        self.maybe_replace_primary(Upstream::Udp(new_sock))
     }
 
     pub fn label(&self) -> String {
@@ -983,6 +1006,59 @@ mod tests {
             UpstreamPool::new(vec![Upstream::Udp("1.2.3.4:53".parse().unwrap())], vec![]);
         assert!(!pool.maybe_update_primary("not-an-ip", 53));
         assert_eq!(pool.preferred().unwrap().to_string(), "1.2.3.4:53");
+    }
+
+    // #169: on undetectable system DNS the rescan adopts the same Quad9 DoH
+    // startup uses, instead of a bare UDP Quad9 that dies wherever outbound
+    // UDP:53 is blocked.
+    #[test]
+    fn maybe_replace_primary_adopts_doh_over_udp() {
+        let mut pool = UpstreamPool::new(
+            vec![Upstream::Udp("192.168.1.1:53".parse().unwrap())],
+            vec![],
+        );
+        let doh = Upstream::Doh {
+            url: "https://9.9.9.9/dns-query".to_string(),
+            client: crate::forward::default_client(),
+        };
+        assert!(pool.maybe_replace_primary(doh.clone()));
+        assert_eq!(
+            pool.preferred().unwrap().to_string(),
+            "https://9.9.9.9/dns-query"
+        );
+        assert!(!pool.maybe_replace_primary(doh), "already on the fallback");
+    }
+
+    // Failover chains fallback after the primaries, so a sibling left behind by
+    // the previous network would be retried before the reachable one (#169).
+    #[test]
+    fn maybe_update_primary_retargets_the_tcp_sibling() {
+        let mut pool = UpstreamPool::new(
+            vec![Upstream::Udp("1.2.3.4:53".parse().unwrap())],
+            vec![Upstream::Tcp("1.2.3.4:53".parse().unwrap())],
+        );
+        assert!(pool.maybe_update_primary("5.6.7.8", 53));
+        assert_eq!(
+            pool.fallback,
+            vec![Upstream::Tcp("5.6.7.8:53".parse().unwrap())]
+        );
+    }
+
+    // Swapping away from DoH leaves no UDP sibling to strip.
+    #[test]
+    fn maybe_replace_primary_from_doh_keeps_fallback_clean() {
+        let mut pool = UpstreamPool::new(
+            vec![Upstream::Doh {
+                url: "https://9.9.9.9/dns-query".to_string(),
+                client: crate::forward::default_client(),
+            }],
+            vec![],
+        );
+        assert!(pool.maybe_update_primary("192.168.1.1", 53));
+        assert_eq!(
+            pool.fallback,
+            vec![Upstream::Tcp("192.168.1.1:53".parse().unwrap())]
+        );
     }
 
     fn tcp_closed_port() -> SocketAddr {
