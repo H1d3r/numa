@@ -8,7 +8,7 @@ use std::net::SocketAddr;
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 
-use log::{debug, error, info};
+use log::{debug, error, info, warn};
 
 use crate::blocklist::{download_blocklists, parse_blocklist, BlocklistStore};
 use crate::bootstrap_resolver::NumaResolver;
@@ -329,11 +329,35 @@ fn spawn_background_services(
 
     let api_ctx = Arc::clone(ctx);
     let api_addr: SocketAddr = format!("{}:{}", config.server.api_bind_addr, api_port).parse()?;
+    let (api_auth, minted) =
+        crate::api_auth::ensure_token(config.server.api_token.as_deref(), &ctx.data_dir);
+    if let Some(m) = minted {
+        info!(
+            "generated an API token for the HTTP control plane: {}",
+            m.token
+        );
+        match m.stored {
+            Some(path) => info!("API token stored at {}", path.display()),
+            None => warn!(
+                "could not persist the API token under {} — it will change on restart; \
+                 set [server] api_token or NUMA_API_TOKEN to pin it",
+                ctx.data_dir.display()
+            ),
+        }
+    }
     tokio::spawn(async move {
-        let app = crate::api::router(api_ctx);
+        let app = crate::api::router(api_ctx).layer(axum::middleware::from_fn_with_state(
+            api_auth,
+            crate::api_auth::require_auth,
+        ));
         let listener = tokio::net::TcpListener::bind(api_addr).await.unwrap();
         info!("HTTP API listening on {}", api_addr);
-        axum::serve(listener, app).await.unwrap();
+        axum::serve(
+            listener,
+            app.into_make_service_with_connect_info::<SocketAddr>(),
+        )
+        .await
+        .unwrap();
     });
 
     // Mobile API: read-only subset for iOS/Android companion apps, LAN-bound
