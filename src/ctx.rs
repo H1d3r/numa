@@ -267,8 +267,7 @@ async fn resolve_with_cname_chase(
     DnssecStatus,
     Option<crate::stats::UpstreamTransport>,
 ) {
-    let mut visited = HashSet::new();
-    visited.insert(qname.to_ascii_lowercase());
+    let mut visited = HashSet::from([qname.to_ascii_lowercase()]);
 
     let (mut resp, path, dnssec, mut ut) = match resolve_local(query, src_addr, qname, qtype, ctx) {
         Some((r, p, d)) => (r, p, d, None),
@@ -277,43 +276,46 @@ async fn resolve_with_cname_chase(
     let mut current_qname = qname.to_string();
 
     loop {
-        if resp.answers.iter().any(|r| r.query_type() == qtype)
-            || resp.header.rescode != ResultCode::NOERROR
-        {
+        if resp.has_answer_of_type(qtype) || resp.header.rescode != ResultCode::NOERROR {
             return (resp, path, dnssec, ut);
         }
-        let Some(target) = crate::recursive::extract_cname_target(&resp, &current_qname) else {
-            return (resp, path, dnssec, ut);
-        };
-        if visited.len() > crate::recursive::MAX_CNAME_DEPTH as usize
-            || !visited.insert(target.to_ascii_lowercase())
-        {
-            return (
-                DnsPacket::response_from(query, ResultCode::SERVFAIL),
-                path,
-                dnssec,
-                ut,
-            );
+        match crate::recursive::follow_cname_links(&resp, &current_qname, &mut visited) {
+            Err(()) => {
+                return (
+                    DnsPacket::response_from(query, ResultCode::SERVFAIL),
+                    path,
+                    dnssec,
+                    ut,
+                )
+            }
+            Ok(None) => return (resp, path, dnssec, ut),
+            Ok(Some(target)) => current_qname = target,
         }
 
-        let sub_query = DnsPacket::query(query.header.id, &target, qtype);
-        let mut sub_buf = BytePacketBuffer::new();
-        sub_query
-            .write(&mut sub_buf)
-            .expect("sub-query serialization");
+        let sub_query = DnsPacket::query(query.header.id, &current_qname, qtype);
         let (sub_resp, _, _, sub_ut) =
-            match resolve_local(&sub_query, src_addr, &target, qtype, ctx) {
+            match resolve_local(&sub_query, src_addr, &current_qname, qtype, ctx) {
                 Some((r, p, d)) => (r, p, d, None),
                 None => {
-                    resolve_remote(&sub_query, sub_buf.filled(), src_addr, &target, qtype, ctx)
-                        .await
+                    let mut sub_buf = BytePacketBuffer::new();
+                    sub_query
+                        .write(&mut sub_buf)
+                        .expect("sub-query serialization");
+                    resolve_remote(
+                        &sub_query,
+                        sub_buf.filled(),
+                        src_addr,
+                        &current_qname,
+                        qtype,
+                        ctx,
+                    )
+                    .await
                 }
             };
 
         resp.answers.extend(sub_resp.answers);
         resp.header.rescode = sub_resp.header.rescode;
         ut = ut.or(sub_ut);
-        current_qname = target;
     }
 }
 
@@ -2802,6 +2804,88 @@ mod tests {
         );
         assert!(
             matches!(&resp.answers[1], DnsRecord::A { addr, .. } if *addr == Ipv4Addr::new(93, 184, 216, 34))
+        );
+    }
+
+    async fn ctx_with_upstream(upstream: SocketAddr) -> Arc<ServerCtx> {
+        let mut ctx = crate::testutil::test_ctx().await;
+        ctx.upstream_pool = Mutex::new(crate::forward::UpstreamPool::new(
+            vec![crate::forward::Upstream::Udp(upstream)],
+            vec![],
+        ));
+        Arc::new(ctx)
+    }
+
+    /// Amazon-style NODATA behind a multi-link CNAME chain: the upstream
+    /// returns both links in one response, and the sub-query for the
+    /// intermediate name re-answers the second link. The chase must not
+    /// append it twice — Chrome rejects duplicate CNAMEs as malformed
+    /// (eu.primevideo.com regression).
+    #[tokio::test]
+    async fn cname_chase_multi_link_response_has_no_duplicate_links() {
+        let chain = crate::testutil::noerror_response(vec![
+            crate::testutil::cname_record("eu.video.test", "tp.video.test", 300),
+            crate::testutil::cname_record("tp.video.test", "cdn.example.net", 300),
+        ]);
+        let tail = crate::testutil::noerror_response(vec![crate::testutil::cname_record(
+            "tp.video.test",
+            "cdn.example.net",
+            300,
+        )]);
+        let nodata = crate::testutil::noerror_response(vec![]);
+
+        let upstream = crate::testutil::mock_upstream_by_qname(vec![
+            ("eu.video.test", chain),
+            ("tp.video.test", tail),
+            ("cdn.example.net", nodata),
+        ])
+        .await;
+        let ctx = ctx_with_upstream(upstream).await;
+
+        let (resp, _) = resolve_in_test(&ctx, "eu.video.test", QueryType::AAAA).await;
+        assert_eq!(resp.header.rescode, ResultCode::NOERROR);
+        assert_eq!(
+            resp.answers.len(),
+            2,
+            "chain must appear exactly once: {:?}",
+            resp.answers
+        );
+    }
+
+    /// HTTPS (type 65) answers parse as `DnsRecord::UNKNOWN`, so the chase's
+    /// termination check must compare wire type numbers — `UNKNOWN(65)` never
+    /// `==` `QueryType::HTTPS`, which kept the chase running past a complete
+    /// answer and re-appended the terminal record (eu.primevideo.com
+    /// regression, second half).
+    #[tokio::test]
+    async fn cname_chase_terminates_on_unknown_variant_record_type() {
+        let https_terminal = DnsRecord::UNKNOWN {
+            domain: "cdn.example.net".to_string(),
+            qtype: 65,
+            data: vec![0, 1, 0, 0],
+            ttl: 300,
+        };
+        let chain = crate::testutil::noerror_response(vec![
+            crate::testutil::cname_record("eu.video.test", "tp.video.test", 300),
+            crate::testutil::cname_record("tp.video.test", "cdn.example.net", 300),
+            https_terminal.clone(),
+        ]);
+        let tail = crate::testutil::noerror_response(vec![https_terminal]);
+
+        let upstream = crate::testutil::mock_upstream_by_qname(vec![
+            ("eu.video.test", chain),
+            ("cdn.example.net", tail),
+        ])
+        .await;
+        let ctx = ctx_with_upstream(upstream).await;
+
+        let (resp, _) = resolve_in_test(&ctx, "eu.video.test", QueryType::HTTPS).await;
+        assert_eq!(resp.header.rescode, ResultCode::NOERROR);
+        assert_eq!(
+            resp.answers.len(),
+            3,
+            "complete answer must not be chased: {:?}",
+            resp.answers
         );
     }
 }

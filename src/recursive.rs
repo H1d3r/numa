@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::atomic::{AtomicU16, Ordering};
 use std::sync::RwLock;
@@ -15,7 +16,7 @@ use crate::srtt::SrttCache;
 use crate::stats::UpstreamTransport;
 
 const MAX_REFERRAL_DEPTH: u8 = 10;
-pub(crate) const MAX_CNAME_DEPTH: u8 = 8;
+const MAX_CNAME_DEPTH: u8 = 8;
 const NS_QUERY_TIMEOUT: Duration = Duration::from_millis(400);
 const TCP_TIMEOUT: Duration = Duration::from_millis(400);
 const UDP_FAIL_THRESHOLD: u8 = 3;
@@ -250,14 +251,15 @@ pub(crate) fn resolve_iterative<'a>(
             }
 
             if !response.answers.is_empty() {
-                let has_target = response.answers.iter().any(|r| r.query_type() == qtype);
-
-                if has_target || qtype == QueryType::CNAME {
+                if response.has_answer_of_type(qtype) || qtype == QueryType::CNAME {
                     cache.write().unwrap().insert(qname, qtype, &response);
                     return Ok(response);
                 }
 
-                if let Some(cname_target) = extract_cname_target(&response, qname) {
+                let mut visited = HashSet::from([qname.to_ascii_lowercase()]);
+                if let Some(cname_target) = follow_cname_links(&response, qname, &mut visited)
+                    .map_err(|()| "CNAME loop in response")?
+                {
                     if cname_depth >= MAX_CNAME_DEPTH {
                         return Err("max CNAME depth exceeded".into());
                     }
@@ -790,7 +792,26 @@ async fn send_query(
     }
 }
 
-pub(crate) fn extract_cname_target(response: &DnsPacket, qname: &str) -> Option<String> {
+/// Follow every CNAME link for `start` present in `response`, recording each
+/// hop in `visited`. Upstreams return multiple chain links per response;
+/// re-querying an intermediate name would append those links a second time
+/// (Chrome rejects responses with duplicate CNAMEs as malformed).
+pub(crate) fn follow_cname_links(
+    response: &DnsPacket,
+    start: &str,
+    visited: &mut HashSet<String>,
+) -> Result<Option<String>, ()> {
+    let mut current = None;
+    while let Some(next) = extract_cname_target(response, current.as_deref().unwrap_or(start)) {
+        if visited.len() > MAX_CNAME_DEPTH as usize || !visited.insert(next.to_ascii_lowercase()) {
+            return Err(());
+        }
+        current = Some(next);
+    }
+    Ok(current)
+}
+
+fn extract_cname_target(response: &DnsPacket, qname: &str) -> Option<String> {
     response.answers.iter().find_map(|r| match r {
         DnsRecord::CNAME { domain, host, .. } if domain.eq_ignore_ascii_case(qname) => {
             Some(host.clone())
