@@ -10,7 +10,7 @@ use std::time::Duration;
 
 use log::{debug, error, info, warn};
 
-use crate::blocklist::{download_blocklists, parse_blocklist, BlocklistStore};
+use crate::blocklist::{download_blocklists, parse_blocklist, source_defect, BlocklistStore};
 use crate::bootstrap_resolver::NumaResolver;
 use crate::buffer::BytePacketBuffer;
 use crate::cache::DnsCache;
@@ -28,6 +28,7 @@ use crate::system_dns::discover_system_dns;
 use crate::udp_listener::UdpListener;
 
 const DOH_FALLBACK: &str = "https://9.9.9.9/dns-query";
+const BLOCKLIST_RETRY_SECS: u64 = 3600;
 
 /// Boot the DNS server and run until the UDP listener errors out.
 pub async fn run(config_path: String) -> crate::Result<()> {
@@ -286,14 +287,21 @@ fn spawn_background_services(
         let bl_ctx = Arc::clone(ctx);
         let bl_resolver = bootstrap_resolver.clone();
         tokio::spawn(async move {
-            load_blocklists(&bl_ctx, &blocklist_lists, Some(bl_resolver.clone())).await;
-
-            let mut interval = tokio::time::interval(Duration::from_secs(refresh_hours * 3600));
-            interval.tick().await;
-            loop {
-                interval.tick().await;
-                info!("refreshing blocklists...");
+            let mut loaded =
                 load_blocklists(&bl_ctx, &blocklist_lists, Some(bl_resolver.clone())).await;
+            loop {
+                // A refresh that left us with nothing is not blocking at all, so
+                // waiting the full cycle to try again turns a brief upstream
+                // outage into a day without blocking (issue #336).
+                let wait = if loaded {
+                    refresh_hours * 3600
+                } else {
+                    BLOCKLIST_RETRY_SECS.min(refresh_hours * 3600)
+                };
+                tokio::time::sleep(Duration::from_secs(wait)).await;
+                info!("refreshing blocklists...");
+                loaded =
+                    load_blocklists(&bl_ctx, &blocklist_lists, Some(bl_resolver.clone())).await;
             }
         });
     }
@@ -800,30 +808,59 @@ async fn network_watch_loop(ctx: Arc<ServerCtx>) {
     }
 }
 
-async fn load_blocklists(ctx: &ServerCtx, lists: &[String], resolver: Option<Arc<NumaResolver>>) {
+/// Returns `false` only when a failure left nothing loaded at all. An emptied
+/// list is a successful load of nothing, and has nothing to retry.
+async fn load_blocklists(
+    ctx: &ServerCtx,
+    lists: &[String],
+    resolver: Option<Arc<NumaResolver>>,
+) -> bool {
     let downloaded = download_blocklists(lists, resolver).await;
 
     // Parse outside the lock to avoid blocking DNS queries during parse (~100ms)
     let mut all_domains = std::collections::HashSet::new();
     let mut sources = Vec::new();
+    let mut failed = lists.len().saturating_sub(downloaded.len());
     for (source, text) in &downloaded {
         let domains = parse_blocklist(text);
+        if let Some(why) = source_defect(source, text, &domains) {
+            error!("blocklist source failed: {source} — {why}");
+            failed += 1;
+            continue;
+        }
         info!("blocklist: {} domains from {}", domains.len(), source);
         all_domains.extend(domains);
         sources.push(source.clone());
     }
     let total = all_domains.len();
 
+    // Nothing to swap in is a failure only if something broke (issue #336);
+    // sources that all loaded and parsed to nothing are a deliberately emptied
+    // list and must be allowed to clear the old one.
+    if total == 0 && failed > 0 {
+        let kept = ctx.blocklist.read().unwrap().domains_loaded();
+        error!(
+            "blocklist refresh failed for {failed} of {} lists — keeping {kept} domains already loaded",
+            lists.len()
+        );
+        return kept > 0;
+    }
+
+    let loaded = sources.len();
     // Swap under lock — sub-microsecond
     ctx.blocklist
         .write()
         .unwrap()
         .swap_domains(all_domains, sources);
-    info!(
-        "blocking enabled: {} unique domains from {} lists",
-        total,
-        downloaded.len()
-    );
+    if failed > 0 {
+        warn!(
+            "blocking degraded: {total} unique domains from {loaded} of {} lists",
+            lists.len()
+        );
+    } else {
+        info!("blocking enabled: {total} unique domains from {loaded} lists");
+    }
+    true
 }
 
 async fn warm_domain(ctx: &ServerCtx, domain: &str) {
@@ -878,5 +915,82 @@ mod tests {
     async fn bind_udp_listeners_rejects_empty() {
         let err = bind_udp_listeners(&[]).await.unwrap_err();
         assert!(err.to_string().contains("bind_addr is empty"));
+    }
+
+    /// Absolute so `local_path` recognises it on Windows too, where a leading
+    /// `/` is not an absolute path.
+    fn temp_path(name: &str) -> String {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir()
+            .join(format!("numa_{name}_{nanos}.txt"))
+            .display()
+            .to_string()
+    }
+
+    fn temp_list(name: &str, body: &str) -> String {
+        let path = temp_path(name);
+        std::fs::write(&path, body).unwrap();
+        path
+    }
+
+    async fn ctx_blocking(domains: &[&str]) -> ServerCtx {
+        let ctx = crate::testutil::test_ctx().await;
+        ctx.blocklist.write().unwrap().swap_domains(
+            domains.iter().map(|d| d.to_string()).collect(),
+            vec!["seed".to_string()],
+        );
+        ctx
+    }
+
+    /// A source that cannot be read is not an instruction to stop blocking:
+    /// the working list must survive (issue #336).
+    #[tokio::test]
+    async fn failed_source_keeps_the_live_list() {
+        let ctx = ctx_blocking(&["ads.example.com"]).await;
+        let missing = temp_path("never_written");
+        let loaded = load_blocklists(&ctx, std::slice::from_ref(&missing), None).await;
+        assert_eq!(ctx.blocklist.read().unwrap().domains_loaded(), 1);
+        assert!(
+            loaded,
+            "a surviving list is still blocking, so wait a full cycle"
+        );
+    }
+
+    /// The same failure with nothing to fall back on leaves blocking inactive,
+    /// which is the one case that must not wait a full refresh cycle.
+    #[tokio::test]
+    async fn total_failure_with_no_live_list_asks_for_a_retry() {
+        let ctx = ctx_blocking(&[]).await;
+        let missing = temp_path("never_written_either");
+        let loaded = load_blocklists(&ctx, std::slice::from_ref(&missing), None).await;
+        assert_eq!(ctx.blocklist.read().unwrap().domains_loaded(), 0);
+        assert!(!loaded);
+    }
+
+    /// But deliberately emptying your own list means block nothing, and must
+    /// not be mistaken for a failure.
+    #[tokio::test]
+    async fn emptied_local_list_clears_the_live_list() {
+        let ctx = ctx_blocking(&["ads.example.com"]).await;
+        let source = temp_list("emptied", "# all clear\n");
+        let loaded = load_blocklists(&ctx, std::slice::from_ref(&source), None).await;
+        let _ = std::fs::remove_file(&source);
+        assert_eq!(ctx.blocklist.read().unwrap().domains_loaded(), 0);
+        assert!(
+            loaded,
+            "an emptied list loaded fine, there is nothing to retry"
+        );
+    }
+
+    #[tokio::test]
+    async fn healthy_local_list_is_swapped_in() {
+        let ctx = ctx_blocking(&["ads.example.com"]).await;
+        let source = temp_list("healthy", "a.com\nb.com\n");
+        load_blocklists(&ctx, std::slice::from_ref(&source), None).await;
+        let _ = std::fs::remove_file(&source);
+        assert_eq!(ctx.blocklist.read().unwrap().domains_loaded(), 2);
     }
 }
