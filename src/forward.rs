@@ -533,6 +533,7 @@ pub async fn forward_with_failover_raw(
     timeout_duration: Duration,
     hedge_delay: Duration,
 ) -> Result<Vec<u8>> {
+    let wire = &crate::wire::ensure_do_bit(wire)[..];
     let mut candidates: Vec<(usize, u64)> = {
         let srtt_read = srtt.read().unwrap();
         pool.primary
