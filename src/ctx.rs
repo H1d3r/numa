@@ -1520,7 +1520,7 @@ mod tests {
         );
         let mut domains = std::collections::HashSet::new();
         domains.insert("ads.tracker.test".to_string());
-        ctx.blocklist.write().unwrap().swap_domains(domains, vec![]);
+        ctx.blocklist.write().unwrap().swap_domains(domains);
         let ctx = Arc::new(ctx);
 
         let (resp, path) = resolve_in_test(&ctx, "ads.tracker.test", QueryType::A).await;
@@ -2022,7 +2022,7 @@ mod tests {
         let mut ctx = crate::testutil::test_ctx().await;
         let mut domains = std::collections::HashSet::new();
         domains.insert("ads.example.com".to_string());
-        ctx.blocklist.write().unwrap().swap_domains(domains, vec![]);
+        ctx.blocklist.write().unwrap().swap_domains(domains);
         ctx.client_policy = ctx_with_policy(&["192.168.1.50"], &[], &["ads.example.com"]);
         ctx.forwarding_rules = vec![ForwardingRule::new(
             "example.com".to_string(),
@@ -2051,7 +2051,7 @@ mod tests {
         let mut ctx = crate::testutil::test_ctx().await;
         let mut domains = std::collections::HashSet::new();
         domains.insert("ads.tracker.test".to_string());
-        ctx.blocklist.write().unwrap().swap_domains(domains, vec![]);
+        ctx.blocklist.write().unwrap().swap_domains(domains);
         ctx.client_policy = ctx_with_policy(&["127.0.0.0/8"], &["unrelated.test"], &[]);
         let ctx = Arc::new(ctx);
 
@@ -2139,7 +2139,7 @@ mod tests {
         let ctx = crate::testutil::test_ctx().await;
         let mut domains = std::collections::HashSet::new();
         domains.insert("ads.tracker.test".to_string());
-        ctx.blocklist.write().unwrap().swap_domains(domains, vec![]);
+        ctx.blocklist.write().unwrap().swap_domains(domains);
         let ctx = Arc::new(ctx);
 
         let (resp, path) = resolve_in_test(&ctx, "ads.tracker.test", QueryType::A).await;
@@ -2176,7 +2176,7 @@ mod tests {
         let ctx = crate::testutil::test_ctx().await;
         let mut domains = std::collections::HashSet::new();
         domains.insert("ads.tracker.test".to_string());
-        ctx.blocklist.write().unwrap().swap_domains(domains, vec![]);
+        ctx.blocklist.write().unwrap().swap_domains(domains);
         let ctx = Arc::new(ctx);
 
         // Blocked A → 0.0.0.0 sinkhole.
