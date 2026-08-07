@@ -329,6 +329,18 @@ fn resolve_local(
     qtype: QueryType,
     ctx: &ServerCtx,
 ) -> Option<(DnsPacket, QueryPath, DnssecStatus)> {
+    // RFC 8482: ANY is answered with a minimal HINFO, never resolved. Kills
+    // the amplification value of qtype 255 before any stage can act on it.
+    if qtype == QueryType::ANY {
+        let mut resp = DnsPacket::response_from(query, ResultCode::NOERROR);
+        resp.answers.push(DnsRecord::UNKNOWN {
+            domain: qname.to_string(),
+            qtype: 13, // HINFO
+            data: b"\x07RFC8482\x00".to_vec(),
+            ttl: 3600,
+        });
+        return Some((resp, QueryPath::Local, DnssecStatus::Indeterminate));
+    }
     if let Some(record) = ctx.overrides.read().unwrap().lookup(qname) {
         let mut resp = DnsPacket::response_from(query, ResultCode::NOERROR);
         resp.answers.push(record);
@@ -1371,6 +1383,45 @@ mod tests {
             resolve_in_test(&ctx, "153.188.168.192.in-addr.arpa", QueryType::PTR).await;
         assert_eq!(path, QueryPath::Local);
         assert_eq!(resp.header.rescode, ResultCode::NXDOMAIN);
+    }
+
+    #[tokio::test]
+    async fn any_query_refused_with_rfc8482_hinfo() {
+        // Upstream would gladly answer ANY; numa must never ask it (RFC 8482).
+        let upstream_addr = crate::testutil::mock_upstream(crate::testutil::a_record_response(
+            "example.com",
+            Ipv4Addr::new(93, 184, 216, 34),
+            300,
+        ))
+        .await;
+
+        let ctx = crate::testutil::test_ctx().await;
+        *ctx.upstream_pool.lock().unwrap() =
+            UpstreamPool::new(vec![Upstream::Udp(upstream_addr)], vec![]);
+        let ctx = Arc::new(ctx);
+
+        let (resp, path) = resolve_in_test(&ctx, "example.com", QueryType::ANY).await;
+
+        assert_eq!(path, QueryPath::Local, "ANY must not reach an upstream");
+        assert_eq!(resp.header.rescode, ResultCode::NOERROR);
+        assert_eq!(resp.answers.len(), 1, "exactly one synthesized HINFO");
+        match &resp.answers[0] {
+            DnsRecord::UNKNOWN {
+                domain,
+                qtype: 13,
+                data,
+                ttl,
+            } => {
+                assert_eq!(domain, "example.com");
+                assert_eq!(
+                    data.as_slice(),
+                    b"\x07RFC8482\x00",
+                    "CPU=\"RFC8482\" OS=\"\""
+                );
+                assert!(*ttl >= 3600, "cacheable TTL so clients stop re-asking");
+            }
+            other => panic!("expected HINFO, got {:?}", other),
+        }
     }
 
     #[tokio::test]
