@@ -244,6 +244,65 @@ fn reply_within_budget(full: &[u8], query_wire: &[u8]) -> Vec<u8> {
     out.filled().to_vec()
 }
 
+/// TCP counterpart of `mock_upstream_raw`, bound to the given address —
+/// answers each length-prefixed query with `bytes` verbatim (ID patched).
+/// Bind it to a UDP stub's address (disjoint port spaces) for TC=1 retry
+/// tests, where UDP truncates and TCP holds the full answer.
+pub async fn tcp_upstream_raw_on(addr: SocketAddr, bytes: Vec<u8>) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
+    tokio::spawn(async move {
+        while let Ok((mut stream, _)) = listener.accept().await {
+            let mut len_buf = [0u8; 2];
+            if stream.read_exact(&mut len_buf).await.is_err() {
+                continue;
+            }
+            let mut query = vec![0u8; u16::from_be_bytes(len_buf) as usize];
+            if stream.read_exact(&mut query).await.is_err() || query.len() < 2 {
+                continue;
+            }
+            let mut reply = bytes.clone();
+            crate::wire::patch_id(&mut reply, u16::from_be_bytes([query[0], query[1]]));
+            let mut out = Vec::with_capacity(2 + reply.len());
+            out.extend_from_slice(&(reply.len() as u16).to_be_bytes());
+            out.extend_from_slice(&reply);
+            let _ = stream.write_all(&out).await;
+        }
+    });
+}
+
+/// DoH counterpart of `mock_upstream_raw`: answers every POST to `/dns-query`
+/// with `bytes` (ID patched), and reports each inbound query wire on the
+/// returned channel. The URL is ready to hand an `Upstream::Doh`.
+pub async fn doh_upstream_raw(
+    bytes: Vec<u8>,
+) -> (String, tokio::sync::mpsc::UnboundedReceiver<Vec<u8>>) {
+    use std::future::IntoFuture;
+
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let app = axum::Router::new().route(
+        "/dns-query",
+        axum::routing::post(move |query: axum::body::Bytes| {
+            let mut reply = bytes.clone();
+            let tx = tx.clone();
+            async move {
+                if query.len() >= 2 {
+                    crate::wire::patch_id(&mut reply, u16::from_be_bytes([query[0], query[1]]));
+                }
+                let _ = tx.send(query.to_vec());
+                (
+                    [(axum::http::header::CONTENT_TYPE, "application/dns-message")],
+                    reply,
+                )
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(axum::serve(listener, app).into_future());
+    (format!("http://{}/dns-query", addr), rx)
+}
+
 /// UDP socket that accepts connections but never replies.
 /// Useful as an upstream that triggers timeouts.
 pub fn blackhole_upstream() -> SocketAddr {

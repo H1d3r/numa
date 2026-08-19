@@ -112,12 +112,18 @@ pub fn patch_ttls(wire: &mut [u8], offsets: &[usize], new_ttl: u32) {
 
 const DO_FLAG: u8 = 0x80;
 const TC_FLAG: u8 = 0x02;
+const QR_FLAG: u8 = 0x80;
 
 /// TC=1 (RFC 1035 §4.1.1, header byte 2) means "this answer did not fit, ask
 /// again over TCP". Cached, it would answer every later client — including the
 /// ones already on TCP, where the retry has nowhere left to go.
 pub fn is_truncated(wire: &[u8]) -> bool {
     wire.get(2).is_some_and(|flags| flags & TC_FLAG != 0)
+}
+
+/// QR=1 (RFC 1035 §4.1.1, header byte 2): the wire is a response.
+pub fn is_response(wire: &[u8]) -> bool {
+    wire.get(2).is_some_and(|flags| flags & QR_FLAG != 0)
 }
 
 /// Make a query wire carry DO=1 within a budget that can hold the answer:
@@ -135,7 +141,7 @@ pub fn ensure_do_bit(wire: &[u8]) -> Cow<'_, [u8]> {
             out[ttl + 2] |= DO_FLAG;
             if !payload_in_budget(&out, ttl) {
                 let clamped = payload(&out, ttl).clamp(MIN_UPSTREAM_PAYLOAD, MAX_UPSTREAM_PAYLOAD);
-                out[ttl - 2..ttl].copy_from_slice(&clamped.to_be_bytes());
+                set_payload(&mut out, ttl, clamped);
             }
             Cow::Owned(out)
         }
@@ -146,16 +152,35 @@ pub fn ensure_do_bit(wire: &[u8]) -> Cow<'_, [u8]> {
     }
 }
 
+/// Raise the advertised budget to our full receive ceiling. A stream transport
+/// has no datagram to fragment, and its TC=1 has nothing left to escalate to —
+/// so a smaller budget only invites a truncated answer we would have to fail
+/// (RFC 8484 §5.1: the server honors what the requestor advertised). Wires with
+/// no OPT to patch go upstream as they came.
+pub fn maximize_payload(wire: &[u8]) -> Cow<'_, [u8]> {
+    match locate_opt(wire) {
+        Ok(OptSite::Flag(ttl)) if payload(wire, ttl) != MAX_UPSTREAM_PAYLOAD => {
+            let mut out = wire.to_vec();
+            set_payload(&mut out, ttl, MAX_UPSTREAM_PAYLOAD);
+            Cow::Owned(out)
+        }
+        _ => Cow::Borrowed(wire),
+    }
+}
+
 /// EDNS payload size is hop-by-hop (RFC 6891 §6.2.3) — upstream answers to us,
 /// not to our client, so the client's budget is not ours to pass on. Forwarding
 /// a small one alongside DO=1 asks for RRSIGs that cannot fit and earns a TC=1
 /// with no records, for answers that fit unsigned.
 const MIN_UPSTREAM_PAYLOAD: u16 = crate::packet::DEFAULT_EDNS_PAYLOAD;
 
-/// Ceiling on the budget we advertise: `forward_udp_raw` receives into 4096
-/// bytes, and a reply larger than the buffer is silently cut into a wire that
-/// cannot parse. Never invite an answer we cannot receive.
-const MAX_UPSTREAM_PAYLOAD: u16 = 4096;
+/// Ceiling on the budget we advertise and on any reply we accept:
+/// `BytePacketBuffer`'s capacity, which `from_bytes` silently cuts to — a
+/// larger wire becomes one that cannot parse. Never invite (or prefer, see the
+/// TC=1 retry) an answer we cannot receive. `forward_udp_raw` sizes its
+/// receive buffer from this same constant.
+pub(crate) const MAX_UPSTREAM_PAYLOAD: u16 = crate::buffer::BUF_SIZE as u16;
+const _: () = assert!(crate::buffer::BUF_SIZE <= u16::MAX as usize);
 
 /// The bare OPT `append_do_opt` writes: root name, TYPE=41, our payload
 /// budget, DO=1. Public so the fuzz oracle asserts against the same bytes.
@@ -168,6 +193,10 @@ pub const APPENDED_DO_OPT: [u8; 11] = {
 /// before its TTL.
 fn payload(wire: &[u8], ttl: usize) -> u16 {
     u16::from_be_bytes([wire[ttl - 2], wire[ttl - 1]])
+}
+
+fn set_payload(wire: &mut [u8], ttl: usize, size: u16) {
+    wire[ttl - 2..ttl].copy_from_slice(&size.to_be_bytes());
 }
 
 fn payload_in_budget(wire: &[u8], ttl: usize) -> bool {
@@ -207,19 +236,32 @@ fn locate_opt(wire: &[u8]) -> Result<OptSite> {
     for _ in 0..count(wire, 6) + count(wire, 8) {
         skip_record(wire, &mut pos)?;
     }
+    let mut opt = None;
     for _ in 0..count(wire, 10) {
-        let ttl_offset = skip_record(wire, &mut pos)?;
+        // A record we cannot skip ends the walk, but not the search: an OPT
+        // already found stays patchable, since nothing behind an unwalkable
+        // record is a TSIG the upstream could verify either. With no OPT yet
+        // there is no trustworthy end to append one at.
+        let ttl_offset = match skip_record(wire, &mut pos) {
+            Ok(offset) => offset,
+            Err(e) => return opt.map(OptSite::Flag).ok_or(e),
+        };
         match record_type(wire, ttl_offset) {
-            TYPE_OPT => return Ok(OptSite::Flag(ttl_offset)),
+            TYPE_OPT => opt = opt.or(Some(ttl_offset)),
             // A TSIG must stay the last record and its MAC covers the header
-            // (RFC 8945 §5.1) — appending an OPT behind it, or bumping
-            // ARCOUNT, voids the signature. Not ours to patch.
+            // (RFC 8945 §5.1) — so a signed query's OPT sits in front of it,
+            // inside the MAC. Patching that OPT, appending one, or bumping
+            // ARCOUNT voids the signature: scan the whole section before
+            // deciding. Not ours to patch.
             TYPE_TSIG => return Err("TSIG-signed message".into()),
             _ => {}
         }
     }
 
-    Ok(OptSite::End(pos))
+    match opt {
+        Some(ttl_offset) => Ok(OptSite::Flag(ttl_offset)),
+        None => Ok(OptSite::End(pos)),
+    }
 }
 
 /// Skip one question entry: name, then QTYPE(2) + QCLASS(2).
@@ -1655,13 +1697,90 @@ mod tests {
         // (RFC 8945 §5.1); patching would void the signature upstream.
         let mut wire = query_wire();
         wire[10..12].copy_from_slice(&1u16.to_be_bytes()); // ARCOUNT
-        wire.extend_from_slice(&[0]); // root name
-        wire.extend_from_slice(&250u16.to_be_bytes()); // TYPE=TSIG
-        wire.extend_from_slice(&[0, 255]); // CLASS=ANY
-        wire.extend_from_slice(&[0, 0, 0, 0]); // TTL
-        wire.extend_from_slice(&[0, 0]); // RDLENGTH
+        wire.extend_from_slice(&tsig_record());
 
         assert_eq!(&ensure_do_bit(&wire)[..], &wire[..]);
+    }
+
+    #[test]
+    fn ensure_do_bit_leaves_opt_plus_tsig_wires_untouched() {
+        // The standard signed-and-EDNS layout: TSIG last (RFC 8945 §5.3), so
+        // the OPT sits in front of it, covered by the MAC. DO clear and a
+        // payload below budget would both normally be patched.
+        let mut wire = query_wire();
+        wire[10..12].copy_from_slice(&2u16.to_be_bytes()); // ARCOUNT
+        wire.extend_from_slice(&[0, 0, 41]); // root name, TYPE=OPT
+        wire.extend_from_slice(&512u16.to_be_bytes()); // payload below budget
+        wire.extend_from_slice(&[0, 0, 0, 0]); // TTL, DO clear
+        wire.extend_from_slice(&[0, 0]); // RDLENGTH
+        wire.extend_from_slice(&tsig_record());
+
+        assert_eq!(&ensure_do_bit(&wire)[..], &wire[..]);
+    }
+
+    #[test]
+    fn maximize_payload_raises_the_stream_budget_to_the_ceiling() {
+        // Over DoH/DoT the 1232 default only invites a TC=1 with nothing left
+        // to escalate to, so every stream transport asks for the ceiling.
+        let wire = ensure_do_bit(&query_wire()).into_owned();
+        assert_eq!(
+            parse_wire(&wire).edns.unwrap().udp_payload_size,
+            MIN_UPSTREAM_PAYLOAD
+        );
+
+        let out = maximize_payload(&wire);
+
+        assert_eq!(out.len(), wire.len(), "patched in place");
+        let edns = parse_wire(&out).edns.expect("OPT present");
+        assert_eq!(edns.udp_payload_size, MAX_UPSTREAM_PAYLOAD);
+        assert!(edns.do_bit, "DO survives the payload patch");
+    }
+
+    #[test]
+    fn maximize_payload_leaves_unpatchable_wires_untouched() {
+        // No OPT to patch, and a TSIG whose MAC we must not void.
+        let bare = query_wire();
+        assert_eq!(&maximize_payload(&bare)[..], &bare[..]);
+
+        let mut signed = query_wire();
+        signed[10..12].copy_from_slice(&1u16.to_be_bytes()); // ARCOUNT
+        signed.extend_from_slice(&tsig_record());
+        assert_eq!(&maximize_payload(&signed)[..], &signed[..]);
+    }
+
+    /// A minimal empty-RDATA TSIG record.
+    fn tsig_record() -> Vec<u8> {
+        let mut rec = vec![0]; // root name
+        rec.extend_from_slice(&TYPE_TSIG.to_be_bytes());
+        rec.extend_from_slice(&[0, 255]); // CLASS=ANY
+        rec.extend_from_slice(&[0, 0, 0, 0]); // TTL
+        rec.extend_from_slice(&[0, 0]); // RDLENGTH
+        rec
+    }
+
+    #[test]
+    fn ensure_do_bit_patches_an_opt_ahead_of_an_unwalkable_record() {
+        // ARCOUNT claims a record that is not there. Letting the failed walk
+        // discard the OPT we already found would send the query on with DO
+        // clear and the client's own budget — both guarantees lost silently.
+        let mut wire = query_wire();
+        wire[10..12].copy_from_slice(&2u16.to_be_bytes()); // ARCOUNT: OPT + junk
+        let do_byte = wire.len() + 7;
+        wire.extend_from_slice(&[0, 0, 41]); // root name, TYPE=OPT
+        wire.extend_from_slice(&512u16.to_be_bytes()); // payload below budget
+        wire.extend_from_slice(&[0, 0, 0, 0]); // TTL, DO clear
+        wire.extend_from_slice(&[0, 0]); // RDLENGTH
+        wire.extend_from_slice(&[0, 0, 1]); // a second record, cut short
+
+        let out = ensure_do_bit(&wire);
+
+        assert_eq!(out.len(), wire.len(), "patched in place");
+        assert_eq!(out[do_byte] & DO_FLAG, DO_FLAG, "DO set on the found OPT");
+        assert_eq!(
+            u16::from_be_bytes([out[do_byte - 4], out[do_byte - 3]]),
+            MIN_UPSTREAM_PAYLOAD,
+            "budget raised to hold the RRSIGs DO asks for"
+        );
     }
 
     #[test]
