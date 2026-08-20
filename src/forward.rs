@@ -5,7 +5,7 @@ use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
 use tokio::net::UdpSocket;
-use tokio::time::timeout;
+use tokio::time::{timeout, timeout_at};
 
 use crate::buffer::BytePacketBuffer;
 use crate::odoh::{query_through_relay, OdohConfigCache};
@@ -350,9 +350,61 @@ pub(crate) async fn forward_udp(
 ) -> Result<DnsPacket> {
     let mut send_buffer = BytePacketBuffer::new();
     query.write(&mut send_buffer)?;
-    let data = forward_udp_raw(send_buffer.filled(), upstream, timeout_duration).await?;
-    let mut recv_buffer = BytePacketBuffer::from_bytes(&data);
-    DnsPacket::from_buffer(&mut recv_buffer)
+
+    let socket = connected_udp(upstream).await?;
+    socket.send(send_buffer.filled()).await?;
+
+    // Loop until a datagram answers the exact question we asked, or the deadline
+    // lapses. A spoof that raced the real reply onto our ephemeral port (SAD DNS
+    // infers it) fails the match and must not end the wait — a single recv would
+    // let the first forged packet win (§ RFC 5452 acceptance check). The txid is
+    // the first two wire bytes, so reject the flood cheaply before a full parse.
+    let want_id = query.header.id.to_be_bytes();
+    let deadline = tokio::time::Instant::now() + timeout_duration;
+    let mut recv_buf = vec![0u8; crate::wire::MAX_UPSTREAM_PAYLOAD as usize + 1];
+    loop {
+        let size = timeout_at(deadline, socket.recv(&mut recv_buf)).await??;
+        // Over the cap: the kernel cut an oversized datagram to fit, and a cut
+        // wire is indistinguishable from a full one. Under 12: no DNS header.
+        if !(12..=crate::wire::MAX_UPSTREAM_PAYLOAD as usize).contains(&size)
+            || recv_buf[..2] != want_id
+        {
+            continue;
+        }
+        let mut recv_buffer = BytePacketBuffer::from_bytes(&recv_buf[..size]);
+        if let Ok(resp) = DnsPacket::from_buffer(&mut recv_buffer) {
+            if response_matches(query, &resp) {
+                return Ok(resp);
+            }
+        }
+    }
+}
+
+/// A connected UDP socket to `upstream`: the kernel then drops datagrams from
+/// anyone but it, leaving source-spoofed off-path injection as the only path in.
+async fn connected_udp(upstream: SocketAddr) -> Result<UdpSocket> {
+    let socket = UdpSocket::bind("0.0.0.0:0").await?;
+    socket.connect(upstream).await?;
+    Ok(socket)
+}
+
+/// A UDP reply we'll act on: QR=1, our transaction ID, and the same question we
+/// asked (case-insensitive name, same type). The connected socket already drops
+/// off-source datagrams; this rejects a source-spoofing off-path injection that
+/// forged the upstream's address to race the real answer.
+fn response_matches(query: &DnsPacket, resp: &DnsPacket) -> bool {
+    if !resp.header.response || resp.header.id != query.header.id {
+        return false;
+    }
+    match resp.questions.first() {
+        Some(got) => query.questions.first().is_some_and(|asked| {
+            asked.qtype == got.qtype && asked.name.eq_ignore_ascii_case(&got.name)
+        }),
+        // Some servers drop the question on errors (FORMERR/REFUSED). Accept
+        // one only when it carries nothing to cache — a bare failure — so a
+        // forged answer can't ride in without naming the question it answers.
+        None => resp.answers.is_empty() && resp.authorities.is_empty(),
+    }
 }
 
 /// DNS over TCP (RFC 1035 §4.2.2): 2-byte length prefix, then the DNS message.
@@ -643,9 +695,7 @@ async fn forward_udp_raw(
     upstream: SocketAddr,
     timeout_duration: Duration,
 ) -> Result<Vec<u8>> {
-    let socket = UdpSocket::bind("0.0.0.0:0").await?;
-    // Connected, so the kernel drops datagrams from anyone but the upstream.
-    socket.connect(upstream).await?;
+    let socket = connected_udp(upstream).await?;
     socket.send(wire).await?;
 
     // One byte of headroom: a datagram sized exactly to the buffer cannot be
@@ -1167,6 +1217,115 @@ mod tests {
         .await;
 
         assert!(result.is_err(), "an off-path reply must not answer");
+    }
+
+    #[test]
+    fn response_matches_accepts_the_echoed_question() {
+        let query = make_query();
+        assert!(response_matches(&query, &make_response(&query)));
+    }
+
+    #[test]
+    fn response_matches_rejects_wrong_id_name_type_or_query() {
+        let query = make_query();
+
+        let mut wrong_id = make_response(&query);
+        wrong_id.header.id ^= 0xFFFF;
+        assert!(!response_matches(&query, &wrong_id), "id must match");
+
+        let mut wrong_name = make_response(&query);
+        wrong_name.questions[0].name = "evil.example".to_string();
+        assert!(!response_matches(&query, &wrong_name), "qname must match");
+
+        let mut wrong_type = make_response(&query);
+        wrong_type.questions[0].qtype = QueryType::AAAA;
+        assert!(!response_matches(&query, &wrong_type), "qtype must match");
+
+        let mut not_a_response = make_response(&query);
+        not_a_response.header.response = false;
+        assert!(!response_matches(&query, &not_a_response), "QR must be set");
+    }
+
+    #[test]
+    fn response_matches_handles_a_question_less_reply_by_cacheability() {
+        let query = make_query();
+
+        // A bare error that omitted the question is accepted so the caller can
+        // fail fast instead of blocking to the deadline.
+        let mut bare_error = make_response(&query);
+        bare_error.questions.clear();
+        bare_error.answers.clear();
+        bare_error.header.rescode = ResultCode::SERVFAIL;
+        assert!(
+            response_matches(&query, &bare_error),
+            "bare error is a match"
+        );
+
+        // The same reply carrying an answer must not ride in unnamed.
+        let mut smuggled_answer = make_response(&query);
+        smuggled_answer.questions.clear();
+        assert!(
+            !response_matches(&query, &smuggled_answer),
+            "a question-less reply may not carry records"
+        );
+    }
+
+    #[test]
+    fn response_matches_is_case_insensitive_on_name() {
+        let query = make_query();
+        let mut mixed_case = make_response(&query);
+        mixed_case.questions[0].name = "ExAmPlE.CoM".to_string();
+        assert!(
+            response_matches(&query, &mixed_case),
+            "0x20 case must not reject"
+        );
+    }
+
+    #[tokio::test]
+    async fn forward_udp_discards_a_spoof_and_takes_the_match() {
+        // The upstream sends a wrong-id spoof first, then the real reply, both
+        // from the connected source. The recv loop must skip the spoof and
+        // return the answer that matches the question we asked.
+        let query = make_query();
+        let good = to_wire(&make_response(&query));
+        let mut spoof = good.clone();
+        crate::wire::patch_id(&mut spoof, query.header.id ^ 0xFFFF);
+
+        let sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let addr = sock.local_addr().unwrap();
+        tokio::spawn(async move {
+            let mut buf = [0u8; 512];
+            let (_, src) = sock.recv_from(&mut buf).await.unwrap();
+            let _ = sock.send_to(&spoof, src).await;
+            let _ = sock.send_to(&good, src).await;
+        });
+
+        let resp = forward_udp(&query, addr, Duration::from_millis(500))
+            .await
+            .expect("the matching reply must win the race");
+        assert_eq!(resp.header.id, query.header.id);
+        assert_eq!(resp.answers.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn forward_udp_times_out_on_a_wrong_id_only_reply() {
+        let query = make_query();
+        let mut spoof = to_wire(&make_response(&query));
+        crate::wire::patch_id(&mut spoof, query.header.id ^ 0xFFFF);
+
+        let sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let addr = sock.local_addr().unwrap();
+        tokio::spawn(async move {
+            let mut buf = [0u8; 512];
+            let (_, src) = sock.recv_from(&mut buf).await.unwrap();
+            let _ = sock.send_to(&spoof, src).await;
+        });
+
+        let result = forward_udp(&query, addr, Duration::from_millis(200)).await;
+        assert!(
+            result.is_err(),
+            "a reply that never matches must not be accepted"
+        );
     }
 
     #[tokio::test]
