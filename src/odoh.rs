@@ -212,8 +212,8 @@ fn parse_odoh_config(body: &[u8], ttl: Duration) -> Result<OdohTargetConfig> {
 /// plaintext DNS wire response.
 ///
 /// Flow: fetch the target's HPKE config (cached), seal the query, POST to the
-/// relay with `Targethost`/`Targetpath` headers, then unseal the response.
-/// On seal/unseal failure we invalidate the cache and retry once — this
+/// relay with the target routing in the query string, then unseal the
+/// response. On seal/unseal failure we invalidate the cache and retry once — this
 /// handles the benign race where the target rotated its key between our
 /// cached config and the POST.
 pub async fn query_through_relay(
@@ -293,7 +293,7 @@ async fn attempt_query(req: &OdohRequest<'_>) -> std::result::Result<Vec<u8>, At
     // HTTP headers, to carry the target routing. `Targethost`/`Targetpath`
     // headers cause relays to treat the request as an unspecified-target and
     // reject it.
-    let (status, resp_body) = timeout_at(req.deadline.into(), async {
+    let (status, failure, resp_body) = timeout_at(req.deadline.into(), async {
         let resp = req
             .client
             .post(req.relay_url)
@@ -308,8 +308,16 @@ async fn attempt_query(req: &OdohRequest<'_>) -> std::result::Result<Vec<u8>, At
             .send()
             .await?;
         let status = resp.status();
+        // `bytes()` consumes the response, so the attribution inputs have to
+        // be read here — but only when there is a failure to attribute.
+        let failure = (!status.is_success()).then(|| {
+            (
+                content_type_matches(resp.headers(), ODOH_CONTENT_TYPE),
+                resp.url().to_string(),
+            )
+        });
         let body = resp.bytes().await?;
-        Ok::<_, reqwest::Error>((status, body))
+        Ok::<_, reqwest::Error>((status, failure, body))
     })
     .await
     .map_err(|_| AttemptError::Other("ODoH relay request timed out".into()))?
@@ -319,10 +327,17 @@ async fn attempt_query(req: &OdohRequest<'_>) -> std::result::Result<Vec<u8>, At
     // error in a sealed 200 response; a 401 from the relay/target is the
     // practical signal that our cached HPKE key is stale. Treat 400 as a
     // client-side bug (malformed ODoH envelope) — retrying would loop-fail.
-    if !status.is_success() {
+    if let Some((forwarded, url)) = failure {
         let preview_len = resp_body.len().min(ERROR_BODY_PREVIEW_BYTES);
         let body_preview = String::from_utf8_lossy(&resp_body[..preview_len]);
-        let msg = format!("ODoH relay returned {status}: {}", body_preview.trim());
+        let msg = describe_failure(
+            status,
+            forwarded,
+            &url,
+            req.cache.target_host(),
+            req.target_path,
+            body_preview.trim(),
+        );
         return Err(if status.as_u16() == 401 {
             AttemptError::KeyRotation(msg)
         } else {
@@ -338,6 +353,44 @@ async fn attempt_query(req: &OdohRequest<'_>) -> std::result::Result<Vec<u8>, At
             .map_err(|e| AttemptError::KeyRotation(format!("ODoH decrypt failed: {e}")))?;
 
     Ok(plaintext_response.into_msg().to_vec())
+}
+
+/// Attribute a non-success status to the hop that produced it: only a relay
+/// that forwarded returns the target's answer under the ODoH media type (RFC
+/// 9230 §4.3). An inference, not proof — a third-party relay may pass a
+/// target error through verbatim.
+fn describe_failure(
+    status: reqwest::StatusCode,
+    forwarded: bool,
+    url: &str,
+    target_host: &str,
+    target_path: &str,
+    preview: &str,
+) -> String {
+    let hop = if forwarded {
+        format!("ODoH target https://{target_host}{target_path} returned {status}")
+    } else {
+        let hint = if status == reqwest::StatusCode::NOT_FOUND {
+            " — check the path in upstream.relay"
+        } else {
+            ""
+        };
+        format!("ODoH relay {url} returned {status}, no ODoH response{hint}")
+    };
+    if preview.is_empty() {
+        hop
+    } else {
+        format!("{hop}: {preview}")
+    }
+}
+
+/// Media-type compare that tolerates parameters (`; charset=…`).
+pub(crate) fn content_type_matches(headers: &HeaderMap, expected: &str) -> bool {
+    headers
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .map(|ct| ct.split(';').next().unwrap_or("").trim() == expected)
+        .unwrap_or(false)
 }
 
 fn cache_control_ttl(headers: &HeaderMap) -> Option<Duration> {
@@ -361,6 +414,7 @@ mod tests {
     use odoh_rs::{ObliviousDoHConfig, ObliviousDoHKeyPair};
     use tokio::net::TcpListener;
 
+    use crate::buffer::BytePacketBuffer;
     use crate::forward::build_https_client;
 
     // RFC 9180 HPKE IDs for the sole ODoH mandatory suite:
@@ -407,6 +461,67 @@ mod tests {
         let remaining = cfg.expires_at.saturating_duration_since(Instant::now());
         assert!(remaining <= MAX_CONFIG_TTL);
         assert!(remaining >= MAX_CONFIG_TTL - Duration::from_secs(1));
+    }
+
+    #[test]
+    fn forwarded_status_names_the_target() {
+        let msg = describe_failure(
+            reqwest::StatusCode::NOT_FOUND,
+            true,
+            "https://relay.example/relay?targethost=odoh.example.com",
+            "odoh.example.com",
+            "/dns-query",
+            "",
+        );
+        assert_eq!(
+            msg,
+            "ODoH target https://odoh.example.com/dns-query returned 404 Not Found"
+        );
+    }
+
+    #[test]
+    fn unforwarded_404_names_the_relay_url_and_the_setting_to_fix() {
+        let msg = describe_failure(
+            reqwest::StatusCode::NOT_FOUND,
+            false,
+            "https://relay.example/relay/",
+            "odoh.example.com",
+            "/dns-query",
+            "",
+        );
+        assert!(msg.contains("https://relay.example/relay/"), "{msg}");
+        assert!(msg.contains("upstream.relay"), "{msg}");
+        assert!(!msg.contains("ODoH target"), "{msg}");
+    }
+
+    #[test]
+    fn relay_rejection_carries_the_body_without_the_path_hint() {
+        let msg = describe_failure(
+            reqwest::StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            false,
+            "https://relay.example/relay",
+            "odoh.example.com",
+            "/dns-query",
+            "expected application/oblivious-dns-message",
+        );
+        assert!(
+            msg.ends_with(": expected application/oblivious-dns-message"),
+            "{msg}"
+        );
+        assert!(!msg.contains("upstream.relay"), "{msg}");
+    }
+
+    #[test]
+    fn content_type_matches_ignores_parameters() {
+        let mut h = HeaderMap::new();
+        h.insert(
+            "content-type",
+            "application/oblivious-dns-message; charset=utf-8"
+                .parse()
+                .unwrap(),
+        );
+        assert!(content_type_matches(&h, ODOH_CONTENT_TYPE));
+        assert!(!content_type_matches(&HeaderMap::new(), ODOH_CONTENT_TYPE));
     }
 
     #[test]
@@ -657,5 +772,67 @@ mod tests {
             cache.last_failure.load_full().is_none(),
             "our own timeout armed the backoff"
         );
+    }
+
+    fn example_com_query() -> BytePacketBuffer {
+        let mut buf = BytePacketBuffer::new();
+        crate::packet::DnsPacket::query(0xABCD, "example.com", crate::question::QueryType::A)
+            .write(&mut buf)
+            .unwrap();
+        buf
+    }
+
+    /// The tests above hand `describe_failure` a `forwarded` flag. These two
+    /// derive it from a real response, which is the assumption the feature
+    /// rests on: only a relay that forwarded answers under the ODoH media
+    /// type. `/nope` stays a media-type-less 404 whether the relay's front
+    /// proxy answers it or the relay's own fallback does.
+    #[tokio::test]
+    #[ignore = "network"]
+    async fn a_target_error_names_the_target() {
+        let client = crate::forward::build_https_client();
+        let cache = OdohConfigCache::new("odoh.crypto.sx".to_string(), client.clone());
+        let buf = example_com_query();
+
+        let err = query_through_relay(
+            buf.filled(),
+            "https://odoh-relay.numa.rs/relay",
+            "/dns-query/",
+            &client,
+            &cache,
+            Duration::from_secs(20),
+        )
+        .await
+        .expect_err("a trailing slash on the target path must fail");
+
+        let msg = err.to_string();
+        assert!(
+            msg.contains("ODoH target https://odoh.crypto.sx/dns-query/"),
+            "{msg}"
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "network"]
+    async fn a_relay_error_names_the_relay_and_the_setting() {
+        let client = crate::forward::build_https_client();
+        let cache = OdohConfigCache::new("odoh.crypto.sx".to_string(), client.clone());
+        let buf = example_com_query();
+
+        let err = query_through_relay(
+            buf.filled(),
+            "https://odoh-relay.numa.rs/nope",
+            "/dns-query",
+            &client,
+            &cache,
+            Duration::from_secs(20),
+        )
+        .await
+        .expect_err("a bad relay path must fail");
+
+        let msg = err.to_string();
+        assert!(msg.contains("https://odoh-relay.numa.rs/nope"), "{msg}");
+        assert!(msg.contains("upstream.relay"), "{msg}");
+        assert!(!msg.contains("ODoH target"), "{msg}");
     }
 }
