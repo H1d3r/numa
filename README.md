@@ -8,7 +8,7 @@
 
 A portable DNS resolver in a single binary. Block ads on any network, name your local services (`frontend.numa`), override any hostname with auto-revert, and seal every outbound query with **ODoH (RFC 9230)** so no single party sees both who you are and what you asked — all from your laptop, no cloud account or Raspberry Pi required.
 
-Built from scratch in Rust. Zero DNS libraries. Caching, ad blocking, and local service domains out of the box. Optional recursive resolution from root nameservers with full DNSSEC chain-of-trust validation, plus a DNS-over-TLS listener for encrypted client connections (iOS Private DNS, systemd-resolved, etc.). Run `numa relay` and the same binary becomes a public ODoH endpoint too — the curated DNSCrypt list currently has one surviving relay, so every Numa deploy materially expands the ecosystem. One ~8MB binary, everything embedded.
+Built from scratch in Rust. Zero DNS libraries. Caching, ad blocking, and local service domains out of the box. Optional recursive resolution from root nameservers with full DNSSEC chain-of-trust validation, plus a DNS-over-TLS listener for encrypted client connections (iOS Private DNS, systemd-resolved, etc.). Run `numa relay` and the same binary becomes a public ODoH endpoint too — the curated DNSCrypt list currently has one surviving relay, so every Numa deploy materially expands the ecosystem. One ~8MB binary, everything embedded. The wire-protocol parser was written by hand as a learning project; later features (recursive resolver, DNSSEC, dashboard) were built with AI assistance.
 
 ![Numa dashboard](assets/hero-demo.gif)
 
@@ -49,7 +49,7 @@ Set as system DNS:
 | Linux | `sudo numa install` | `sudo numa uninstall` |
 | Windows | `numa install` (admin) + reboot | `numa uninstall` (admin) + reboot |
 
-On macOS and Linux, numa runs as a system service (launchd/systemd). On Windows, numa auto-starts on login via registry. Windows also binds `127.0.0.2:53` (the built-in Dnscache owns `127.0.0.1:53`) and installs an NRPT rule to route queries to it — so edit `bind_addr`/`api_bind_addr` against `127.0.0.2`, not `127.0.0.1`.
+On macOS and Linux, numa runs as a system service (launchd/systemd). The systemd unit is unprivileged (`DynamicUser=yes`, only `CAP_NET_BIND_SERVICE`); the launchd daemon runs as root. `numa install` reconfigures systemd-resolved through a drop-in that `numa uninstall` removes; any other process holding port 53 (dnsmasq, including NetworkManager's) has to be stopped by hand. On Windows, numa auto-starts on login via registry. Windows also binds `127.0.0.2:53` (the built-in Dnscache owns `127.0.0.1:53`) and installs an NRPT rule to route queries to it — so edit `bind_addr`/`api_bind_addr` against `127.0.0.2`, not `127.0.0.1`.
 
 ## Local Services
 
@@ -78,10 +78,12 @@ DNSSEC validates the full chain of trust: RRSIG signatures, DNSKEY verification,
 
 **DNS-over-TLS listener** (RFC 7858) — accept encrypted queries on port 853 from strict clients like iOS Private DNS, systemd-resolved, or stubby. Two modes:
 
-- **Self-signed** (default) — numa generates a local CA automatically. `numa install` adds it to the system trust store on macOS, Linux (Debian/Ubuntu, Fedora/RHEL/SUSE, Arch), and Windows. On iOS, install the `.mobileconfig` from `numa setup-phone`. Firefox keeps its own NSS store and ignores the system one — trust the CA there manually if you need HTTPS for `.numa` services in Firefox.
+- **Self-signed** (default) — numa generates a local CA automatically. `numa install` adds it to the system trust store on macOS, Linux (Debian/Ubuntu, Fedora/RHEL/SUSE, Arch), and Windows, and `numa uninstall` removes it. On iOS, install the `.mobileconfig` from `numa setup-phone`. Firefox keeps its own NSS store and ignores the system one — trust the CA there manually if you need HTTPS for `.numa` services in Firefox.
 - **Bring-your-own cert** — point `[dot] cert_path` / `key_path` at a publicly-trusted cert (e.g., Let's Encrypt via DNS-01 challenge on a domain pointing at your numa instance). Clients connect without any trust-store setup — same UX as AdGuard Home or Cloudflare `1.1.1.1`.
 
 ALPN `"dot"` is advertised and enforced in both modes; a handshake with mismatched ALPN is rejected as a cross-protocol confusion defense.
+
+**Oblivious DoH** (RFC 9230) — with `[upstream] mode = "odoh"` ([recipe](recipes/odoh-upstream.md)) each query is HPKE-sealed to the target and sent through a relay. The relay sees your IP and ciphertext, the target sees the question and the relay's IP, and a relay that redirects the query hands the new destination something it cannot decrypt. Numa refuses a relay and target that share a registrable domain. ODoH does not hide the connection you open afterwards: your ISP still sees the destination IP and, without ECH, the hostname in the TLS handshake.
 
 **Phone setup** — point your iPhone or Android at Numa in one step:
 
