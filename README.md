@@ -155,6 +155,18 @@ Turnkey compose recipes:
 | Portable (laptop) | No (appliance) | No (appliance) | Server | Single binary, macOS/Linux/Windows |
 | Community maturity | 56K stars, 10 years | 33K stars | 20 years | New |
 
+## Running Numa as Your Primary DNS
+
+**If Numa stops.** `numa install` registers Numa with launchd (macOS) or systemd (Linux), which restart it when it exits. If Numa is your only resolver, DNS lookups fail until it restarts. To stop using Numa and restore the machine's previous DNS settings, run `sudo numa uninstall`.
+
+If Numa is running but upstreams are unreachable, it can serve cached answers for up to an hour past their TTL (RFC 8767). Names it hasn't cached fail.
+
+**Testing.** The DNS parser is fuzzed on every pull request that touches it, with longer runs weekly ([`fuzz.yml`](.github/workflows/fuzz.yml)). CI runs `cargo audit` on dependencies and installs, reinstalls and uninstalls Numa on macOS and Linux.
+
+**Resolver hardening.** In recursive mode, Numa drops answer records outside the zone being queried, refuses to query nameservers at private or loopback addresses, and caps each lookup's upstream queries and referral depth. Replies over plain UDP must match the query's random transaction ID and question. ANY queries are refused. DNSSEC validation is off by default; `numa dnssec on` turns it on. To report a vulnerability privately, see [SECURITY.md](SECURITY.md).
+
+**What Numa doesn't do.** No DHCP, no clustering, no config sync between instances. Most settings live in [`numa.toml`](numa.toml), not the dashboard. For a whole network, run it on a machine that stays on.
+
 ## Performance
 
 0.1ms cached queries — matches Unbound and AdGuard Home. Wire-level cache stores raw bytes with in-place TTL patching. Request hedging eliminates p99 spikes: cold recursive p99 538ms vs Unbound 748ms (−28%), σ 4× tighter. [Benchmarks →](benches/)
