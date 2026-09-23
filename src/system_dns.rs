@@ -1242,9 +1242,20 @@ fn print_install_summary(skip_system_dns: bool) {
     // data_dir(), not a relative path: under sudo the daemon reads the
     // system config, not numa.toml in the caller's cwd.
     let config_path = crate::data_dir().join("numa.toml");
-    let api_port = crate::config::load_config(&config_path.to_string_lossy())
-        .map(|c| c.config.server.api_port)
-        .unwrap_or(crate::config::DEFAULT_API_PORT);
+    let server = crate::config::load_config(&config_path.to_string_lossy())
+        .map(|c| c.config.server)
+        .unwrap_or_default();
+    let api_port = server.api_port;
+    let token_source = if server.api_token.as_deref().is_some_and(|t| !t.is_empty()) {
+        format!("[server] api_token in {}", config_path.display())
+    } else {
+        server
+            .data_dir
+            .unwrap_or_else(crate::data_dir)
+            .join(crate::api_auth::TOKEN_FILE)
+            .display()
+            .to_string()
+    };
 
     if skip_system_dns {
         eprintln!(
@@ -1260,6 +1271,7 @@ fn print_install_summary(skip_system_dns: bool) {
     let uninstall = "sudo numa uninstall";
 
     eprintln!("  Dashboard  https://numa.numa  (or http://127.0.0.1:{api_port})");
+    eprintln!("  API token  {token_source}  # not needed over localhost; any username");
     eprintln!("  Remove     {uninstall}  # restores original DNS");
 }
 
