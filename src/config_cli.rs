@@ -2,7 +2,7 @@ use crate::config::{ConfigLoad, ServerConfig};
 use serde::Deserialize;
 use std::io::{Read, Write};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpStream};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, Instant};
 
@@ -13,6 +13,7 @@ struct EffectiveConfigPath {
     path: String,
     from_daemon: bool,
     note: Option<String>,
+    data_dir: Option<PathBuf>,
 }
 
 impl EffectiveConfigPath {
@@ -30,6 +31,8 @@ struct StatsConfigPath {
     // Absent on daemons predating this field; assume the pre-existing behavior.
     #[serde(default = "default_true")]
     config_found: bool,
+    #[serde(default)]
+    data_dir: Option<PathBuf>,
 }
 
 fn default_true() -> bool {
@@ -71,6 +74,59 @@ pub fn edit_config() -> Result<(), String> {
     Ok(())
 }
 
+pub fn print_token() -> Result<(), String> {
+    use crate::api_auth::{locate_token, TokenSource, TOKEN_FILE};
+
+    let resolved = effective_config_path()?;
+    let config_path = resolved.path;
+    let server = crate::config::load_config(&config_path)
+        .map_err(|error| unreadable(&config_path, &error))?
+        .config
+        .server;
+    // The daemon's view wins: a relative data_dir resolves against its cwd, not ours.
+    let data_dir = resolved
+        .data_dir
+        .or(server.data_dir)
+        .unwrap_or_else(crate::data_dir);
+    let file = data_dir.join(TOKEN_FILE);
+
+    let Some((token, source)) = locate_token(server.api_token.as_deref(), &data_dir) else {
+        return Err(match std::fs::File::open(&file) {
+            Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+                format!("cannot read {}: run with {ELEVATE}", file.display())
+            }
+            _ => format!(
+                "no token at {} yet: numa creates one on first start",
+                file.display()
+            ),
+        });
+    };
+    let origin = match source {
+        TokenSource::Env => "NUMA_API_TOKEN in this shell (the service may see another)".into(),
+        TokenSource::Config => format!("[server] api_token in {config_path}"),
+        TokenSource::File(path) => path.display().to_string(),
+    };
+    eprintln!("API token, from {origin}");
+    eprintln!("use it as the password on other devices (any username; localhost needs none):");
+    println!("{token}");
+    Ok(())
+}
+
+const ELEVATE: &str = if cfg!(windows) {
+    "an administrator shell"
+} else {
+    "sudo"
+};
+
+fn unreadable(path: &str, error: &crate::Error) -> String {
+    match error.downcast_ref::<std::io::Error>() {
+        Some(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+            format!("cannot read {path}: run with {ELEVATE}")
+        }
+        _ => format!("cannot read {path}: {error}"),
+    }
+}
+
 pub(crate) fn service_config_path() -> Result<String, String> {
     effective_config_path().map(|resolved| resolved.display())
 }
@@ -108,6 +164,7 @@ where
             path: stats.config_path,
             from_daemon: true,
             note: (!stats.config_found).then(|| DEFAULTS_NOTE.to_string()),
+            data_dir: stats.data_dir,
         }),
         Err(probe_error) => {
             let loaded = local.map_err(|error| error.to_string())?;
@@ -120,6 +177,7 @@ where
                 path: loaded.path,
                 from_daemon: false,
                 note: Some(note),
+                data_dir: None,
             })
         }
     }
@@ -270,7 +328,19 @@ mod tests {
         StatsConfigPath {
             config_path: path.to_string(),
             config_found: found,
+            data_dir: None,
         }
+    }
+
+    #[test]
+    fn unreadable_config_suggests_elevation() {
+        let denied: crate::Error =
+            std::io::Error::from(std::io::ErrorKind::PermissionDenied).into();
+        let message = unreadable("/root/.config/numa/numa.toml", &denied);
+        assert!(
+            message.ends_with(&format!(": run with {ELEVATE}")),
+            "{message}"
+        );
     }
 
     #[test]
@@ -383,6 +453,16 @@ mod tests {
         assert_eq!(stats.config_path, "/var/lib/numa/numa.toml");
         assert!(stats.config_found);
         server.join().unwrap();
+    }
+
+    #[test]
+    fn daemon_data_dir_is_carried_through() {
+        let resolved = resolve_effective_config_path(local_config("numa.toml", 5380, true), |_| {
+            serde_json::from_str(r#"{"config_path":"/srv/numa.toml","data_dir":"/srv/data"}"#)
+                .map_err(|e| e.to_string())
+        })
+        .unwrap();
+        assert_eq!(resolved.data_dir, Some(PathBuf::from("/srv/data")));
     }
 
     #[test]
